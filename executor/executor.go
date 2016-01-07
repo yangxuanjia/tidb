@@ -737,6 +737,7 @@ func (e *AggregateExec) Next() (*Row, error) {
 	r := &Row{
 		Data: make([]interface{}, len(e.ResultFields)),
 	}
+
 	for i, field := range e.ResultFields {
 		val, err := evaluator.Eval(e.ctx, field.Expr)
 		if err != nil {

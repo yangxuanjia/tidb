@@ -69,6 +69,12 @@ func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
 	defer func() {
 		b.hasAgg = false
 	}()
+	var aggFuncs []*AggregateFuncExpr
+	if aggDetetor.HasAggFunc {
+		extractor := &AggregateFuncExtractor{AggFuncs: make([]*AggregateFuncExpr)}
+		aggFuncs = extractor.AggFuncs
+		// TODO: extract aggfuncs from having clause.
+	}
 
 	var p Plan
 	if sel.From != nil {
@@ -88,11 +94,17 @@ func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
 				return nil
 			}
 		}
+		if len(aggFuncs) > 0 {
+			p = b.buildAggregate(p, aggFuncs)
+		}
 		p = b.buildSelectFields(p, sel.GetResultFields())
 		if b.err != nil {
 			return nil
 		}
 	} else {
+		if len(aggFuncs) > 0 {
+			p = b.buildAggregate(p, aggFuncs)
+		}
 		p = b.buildSelectFields(p, sel.GetResultFields())
 		if b.err != nil {
 			return nil
@@ -178,20 +190,17 @@ func (b *planBuilder) buildSelectFields(src Plan, fields []*ast.ResultField) Pla
 	selectFields := &SelectFields{}
 	selectFields.SetSrc(src)
 	selectFields.SetFields(fields)
-
-	if b.hasAgg {
-		// Add aggregate plan.
-		aggPlan := &Aggregate{}
-		aggPlan.SetSrc(src)
-		aggPlan.SetFields(fields)
-		selectFields.SetSrc(aggPlan)
-		// Change ColumnNameExpr.InAggregate to true.
-		marker := &ast.ColumnAggMarker{}
-		for _, field := range fields {
-			field.Expr.Accept(marker)
-		}
-	}
 	return selectFields
+}
+
+func (b *planBuilder) buildAggregate(src Plan, aggFuncs []*ast.AggregateFuncExpr) Plan {
+	// Add aggregate plan.
+	aggPlan := &Aggregate{
+		AggFuncs: aggFuncs,
+	}
+	aggPlan.SetSrc(src)
+	aggPlan.SetFields(src.Fields())
+	return aggPlan
 }
 
 func (b *planBuilder) buildSort(src Plan, byItems []*ast.ByItem) Plan {

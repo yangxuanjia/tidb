@@ -957,9 +957,6 @@ func parseDayInterval(value interface{}) (int64, error) {
 }
 
 func (e *Evaluator) aggregateFunc(v *ast.AggregateFuncExpr) bool {
-	if v.Done {
-		return true
-	}
 	if v.Context == nil {
 		v.Context = &ast.AggEvalueContext{}
 		if v.Distinct {

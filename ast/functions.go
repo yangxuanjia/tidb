@@ -356,15 +356,6 @@ func (n *FuncDateArithExpr) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-type aggDone struct{}
-
-// String implements Stringer interface.
-func (a aggDone) String() string {
-	return "aggdone"
-}
-
-var AggDone = aggDone{}
-
 // AggregateFuncExpr represents aggregate function expression.
 type AggregateFuncExpr struct {
 	funcNode
@@ -377,9 +368,9 @@ type AggregateFuncExpr struct {
 	// but "sum(distinct c1)" is "3".
 	Distinct bool
 
-	Context *AggEvalueContext
-	// Done is used to indicate if aggregation is done.
-	Done bool
+	// ContextPerGroup is used to store aggregate evaluation context.
+	// Each entry for a group.
+	ContextPerGroup map[string](*AggEvaluateContext)
 }
 
 // Accept implements Node Accept interface.
@@ -427,22 +418,17 @@ func (a *AggFuncDetector) Leave(n Node) (node Node, ok bool) {
 }
 
 // Visit Expr tree to set ColunmNameExpr.InAggregate to true.
-type ColumnAggMarker struct {
+type AggregateFuncExtractor struct {
 	inAggregateFuncExpr bool
+	AggFuncs            []*AggregateFuncExpr
 }
 
 // Enter implemets Visitor interface.
-func (a *ColumnAggMarker) Enter(n Node) (node Node, skipChildren bool) {
+func (a *AggregateFuncExtractor) Enter(n Node) (node Node, skipChildren bool) {
 	switch v := n.(type) {
 	case *AggregateFuncExpr:
 		a.inAggregateFuncExpr = true
-	case *ColumnNameExpr:
-		if !a.inAggregateFuncExpr {
-			// For example: select sum(c) + c from t;
-			// The c in sum() should be evaluated for each row.
-			// The c after plus should be evaluated only once.
-			v.InAggregate = true
-		}
+		a.AggFuncs = append(a.AggFuncs, v)
 	case *SelectStmt, *InsertStmt, *DeleteStmt, *UpdateStmt:
 		// Enter a new context, skip it.
 		// For example: select sum(c) + c + exists(select c from t) from t;
@@ -452,10 +438,22 @@ func (a *ColumnAggMarker) Enter(n Node) (node Node, skipChildren bool) {
 }
 
 // Leave implemets Visitor interface.
-func (a *ColumnAggMarker) Leave(n Node) (node Node, ok bool) {
+func (a *AggregateFuncExtractor) Leave(n Node) (node Node, ok bool) {
 	switch n.(type) {
 	case *AggregateFuncExpr:
 		a.inAggregateFuncExpr = false
+	case *ColumnNameExpr:
+		// compose new AggregateFuncExpr
+		if !a.inAggregateFuncExpr {
+			// For example: select sum(c) + c from t;
+			// The c in sum() should be evaluated for each row.
+			// The c after plus should be evaluated only once.
+			agg := &AggregateFuncExpr{
+				F:    "FirstRowColumn",
+				Args: []ExprNode{n},
+			}
+			return agg, true
+		}
 	}
 	return n, true
 }
@@ -519,7 +517,7 @@ func (a *AggregateDistinct) Clear() {
 	a.Distinct, _ = memkv.CreateTemp(true)
 }
 
-type AggEvalueContext struct {
+type AggEvaluateContext struct {
 	Distinct *AggregateDistinct
 	Count    int64
 	Value    interface{}

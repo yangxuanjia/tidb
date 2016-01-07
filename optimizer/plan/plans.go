@@ -315,6 +315,7 @@ func (p *Deallocate) Accept(v Visitor) (Plan, bool) {
 // Agggregate represents a select fields plan.
 type Aggregate struct {
 	planWithSrc
+	AggFuncs []*ast.AggregateFuncExpr
 }
 
 // Accept implements Plan Accept interface.
