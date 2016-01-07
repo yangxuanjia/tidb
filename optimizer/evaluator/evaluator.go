@@ -218,7 +218,12 @@ func (e *Evaluator) compareSubquery(v *ast.CompareSubqueryExpr) bool {
 }
 
 func (e *Evaluator) columnName(v *ast.ColumnNameExpr) bool {
+	if v.InAggregate && v.Evaluated {
+		// Evaluate only once in aggregate environment.
+		return true
+	}
 	v.SetValue(v.Refer.Expr.GetValue())
+	v.Evaluated = true
 	return true
 }
 

@@ -42,7 +42,8 @@ func BuildPlan(node ast.Node) (Plan, error) {
 // planBuilder builds Plan from an ast.Node.
 // It just build the ast node straightforwardly.
 type planBuilder struct {
-	err error
+	err    error
+	hasAgg bool
 }
 
 func (b *planBuilder) build(node ast.Node) Plan {
@@ -61,6 +62,14 @@ func (b *planBuilder) build(node ast.Node) Plan {
 }
 
 func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
+	// Detect aggregate function or groupby clause.
+	aggDetetor := &ast.AggFuncDetector{}
+	sel.Accept(aggDetetor)
+	b.hasAgg = aggDetetor.HasAggFunc
+	defer func() {
+		b.hasAgg = false
+	}()
+
 	var p Plan
 	if sel.From != nil {
 		p = b.buildJoin(sel.From.TableRefs)
@@ -170,21 +179,17 @@ func (b *planBuilder) buildSelectFields(src Plan, fields []*ast.ResultField) Pla
 	selectFields.SetSrc(src)
 	selectFields.SetFields(fields)
 
-	hasAgg := false
-	for _, field := range fields {
-		aggDetetor := &ast.AggFuncDetector{}
-		field.Expr.Accept(aggDetetor)
-		if aggDetetor.HasAggFunc {
-			hasAgg = true
-			break
-		}
-	}
-	if hasAgg {
-		// Add aggregate plan
+	if b.hasAgg {
+		// Add aggregate plan.
 		aggPlan := &Aggregate{}
 		aggPlan.SetSrc(src)
 		aggPlan.SetFields(fields)
 		selectFields.SetSrc(aggPlan)
+		// Change ColumnNameExpr.InAggregate to true.
+		marker := &ast.ColumnAggMarker{}
+		for _, field := range fields {
+			field.Expr.Accept(marker)
+		}
 	}
 	return selectFields
 }

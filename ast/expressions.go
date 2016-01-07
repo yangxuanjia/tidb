@@ -324,6 +324,14 @@ type ColumnNameExpr struct {
 	// Refer is the result field the column name refers to.
 	// The value of Refer.Expr is used as the value of the expression.
 	Refer *ResultField
+
+	// InAggregate indicate if the expr is in aggregate function or in groupby environment.
+	// If it is true, we should only evaluate the expr with the first row in the group.
+	InAggregate bool
+
+	// Evaluated indicate if the expr is already evaluated.
+	// If InAggregate is true and Evaluated is true, we should not evaluate it again.
+	Evaluated bool
 }
 
 // Accept implements Node Accept interface.

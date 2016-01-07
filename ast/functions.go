@@ -402,19 +402,62 @@ func (n *AggregateFuncExpr) Accept(v Visitor) (Node, bool) {
 // Visit Expr tree to check if it contains AggregateFuncExpr.
 type AggFuncDetector struct {
 	HasAggFunc bool
+	detecting  bool
 }
 
 // Enter implemets Visitor interface.
 func (a *AggFuncDetector) Enter(n Node) (node Node, skipChildren bool) {
-	if _, ok := n.(*AggregateFuncExpr); ok {
+	switch n.(type) {
+	case *AggregateFuncExpr, *GroupByClause:
 		a.HasAggFunc = true
+	case *SelectStmt, *InsertStmt, *DeleteStmt, *UpdateStmt:
+		if a.detecting {
+			// Enter a new context, skip it.
+			// For example: select sum(c) + c + exists(select c from t) from t;
+			return n, true
+		}
 	}
+	a.detecting = true
 	return n, a.HasAggFunc
 }
 
 // Leave implemets Visitor interface.
 func (a *AggFuncDetector) Leave(n Node) (node Node, ok bool) {
 	return n, !a.HasAggFunc
+}
+
+// Visit Expr tree to set ColunmNameExpr.InAggregate to true.
+type ColumnAggMarker struct {
+	inAggregateFuncExpr bool
+}
+
+// Enter implemets Visitor interface.
+func (a *ColumnAggMarker) Enter(n Node) (node Node, skipChildren bool) {
+	switch v := n.(type) {
+	case *AggregateFuncExpr:
+		a.inAggregateFuncExpr = true
+	case *ColumnNameExpr:
+		if !a.inAggregateFuncExpr {
+			// For example: select sum(c) + c from t;
+			// The c in sum() should be evaluated for each row.
+			// The c after plus should be evaluated only once.
+			v.InAggregate = true
+		}
+	case *SelectStmt, *InsertStmt, *DeleteStmt, *UpdateStmt:
+		// Enter a new context, skip it.
+		// For example: select sum(c) + c + exists(select c from t) from t;
+		return n, true
+	}
+	return n, false
+}
+
+// Leave implemets Visitor interface.
+func (a *ColumnAggMarker) Leave(n Node) (node Node, ok bool) {
+	switch n.(type) {
+	case *AggregateFuncExpr:
+		a.inAggregateFuncExpr = false
+	}
+	return n, true
 }
 
 // AggregateDistinct handles distinct data for aggregate function: count, sum, avg, and group_concat.

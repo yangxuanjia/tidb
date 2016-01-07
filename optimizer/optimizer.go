@@ -92,7 +92,6 @@ func (c *supportChecker) Enter(in ast.Node) (ast.Node, bool) {
 		fn := strings.ToLower(ti.F)
 		switch fn {
 		case "count":
-			c.unsupported = false
 		default:
 			c.unsupported = true
 		}

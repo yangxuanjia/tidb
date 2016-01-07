@@ -1021,3 +1021,33 @@ func (s *testEvaluatorSuite) TestUnaryOp(c *C) {
 		c.Assert(ret, Equals, 0)
 	}
 }
+
+func (s *testEvaluatorSuite) TestColumnNameExpr(c *C) {
+	ctx := mock.NewContext()
+	value1 := ast.NewValueExpr(1)
+	rf := &ast.ResultField{Expr: value1}
+	expr := &ast.ColumnNameExpr{Refer: rf}
+
+	result, err := Eval(ctx, expr)
+	c.Assert(err, IsNil)
+	c.Assert(result, Equals, 1)
+
+	value2 := ast.NewValueExpr(2)
+	rf.Expr = value2
+	result, err = Eval(ctx, expr)
+	c.Assert(err, IsNil)
+	c.Assert(result, Equals, 2)
+
+	// For aggregate environment, ColumnNameExpr should only evaluate once.
+	expr1 := &ast.ColumnNameExpr{Refer: rf, InAggregate: true}
+	result, err = Eval(ctx, expr1)
+	c.Assert(err, IsNil)
+	c.Assert(expr1.Evaluated, IsTrue)
+	c.Assert(result, Equals, 2)
+
+	rf.Expr = value1
+	result, err = Eval(ctx, expr1)
+	c.Assert(err, IsNil)
+	c.Assert(expr1.Evaluated, IsTrue)
+	c.Assert(result, Equals, 2)
+}
