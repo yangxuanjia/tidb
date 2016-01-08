@@ -312,7 +312,7 @@ func (p *Deallocate) Accept(v Visitor) (Plan, bool) {
 	return v.Leave(p)
 }
 
-// Agggregate represents a select fields plan.
+// Aggregate represents a select fields plan.
 type Aggregate struct {
 	planWithSrc
 	AggFuncs []*ast.AggregateFuncExpr

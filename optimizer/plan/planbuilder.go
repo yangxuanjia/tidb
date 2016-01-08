@@ -65,17 +65,18 @@ func (b *planBuilder) buildSelect(sel *ast.SelectStmt) Plan {
 	// Detect aggregate function or groupby clause.
 	aggDetetor := &ast.AggFuncDetector{}
 	sel.Accept(aggDetetor)
-	b.hasAgg = aggDetetor.HasAggFunc
-	defer func() {
-		b.hasAgg = false
-	}()
-	var aggFuncs []*AggregateFuncExpr
+	// TODO: check error
+	var aggFuncs []*ast.AggregateFuncExpr
 	if aggDetetor.HasAggFunc {
-		extractor := &AggregateFuncExtractor{AggFuncs: make([]*AggregateFuncExpr)}
+		extractor := &ast.AggregateFuncExtractor{AggFuncs: make([]*ast.AggregateFuncExpr, 0)}
+		// TODO: extract aggfuncs from having clause.
+		for _, f := range sel.GetResultFields() {
+			f.Expr.Accept(extractor)
+			// TODO: check error
+		}
 		aggFuncs = extractor.AggFuncs
 		// TODO: extract aggfuncs from having clause.
 	}
-
 	var p Plan
 	if sel.From != nil {
 		p = b.buildJoin(sel.From.TableRefs)
@@ -199,7 +200,9 @@ func (b *planBuilder) buildAggregate(src Plan, aggFuncs []*ast.AggregateFuncExpr
 		AggFuncs: aggFuncs,
 	}
 	aggPlan.SetSrc(src)
-	aggPlan.SetFields(src.Fields())
+	if src != nil {
+		aggPlan.SetFields(src.Fields())
+	}
 	return aggPlan
 }
 

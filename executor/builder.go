@@ -180,6 +180,7 @@ func (b *executorBuilder) buildAggregate(v *plan.Aggregate) Executor {
 		Src:          src,
 		ResultFields: v.Fields(),
 		ctx:          b.ctx,
+		AggFuncs:     v.AggFuncs,
 	}
 	return e
 }

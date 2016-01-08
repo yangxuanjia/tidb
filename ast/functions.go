@@ -16,6 +16,7 @@ package ast
 import (
 	"strings"
 
+	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv/memkv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/util/types"
@@ -356,6 +357,17 @@ func (n *FuncDateArithExpr) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
+const (
+	// AggFuncCount is the name of Count function.
+	AggFuncCount = "count"
+	// AggFuncSum is the name of Sum function.
+	AggFuncSum = "sum"
+	// AggFuncAvg is the name of Avg function.
+	AggFuncAvg = "avg"
+	// AggFuncFirstRow is the name of FirstRowColumn function.
+	AggFuncFirstRow = "firstrow"
+)
+
 // AggregateFuncExpr represents aggregate function expression.
 type AggregateFuncExpr struct {
 	funcNode
@@ -368,6 +380,7 @@ type AggregateFuncExpr struct {
 	// but "sum(distinct c1)" is "3".
 	Distinct bool
 
+	CurrentGroup string
 	// ContextPerGroup is used to store aggregate evaluation context.
 	// Each entry for a group.
 	ContextPerGroup map[string](*AggEvaluateContext)
@@ -390,7 +403,77 @@ func (n *AggregateFuncExpr) Accept(v Visitor) (Node, bool) {
 	return v.Leave(n)
 }
 
-// Visit Expr tree to check if it contains AggregateFuncExpr.
+// Update is used for update aggregate context.
+func (n *AggregateFuncExpr) Update() error {
+	name := strings.ToLower(n.F)
+	switch name {
+	case AggFuncCount:
+		return n.updateCount()
+	case AggFuncFirstRow:
+		return n.updateFirstRow()
+	}
+	return nil
+}
+
+// GetContext get aggregate evaluation context for the current group.
+// If it is nil, add a new context into ContextPerGroup.
+func (n *AggregateFuncExpr) GetContext() *AggEvaluateContext {
+	if n.ContextPerGroup == nil {
+		n.ContextPerGroup = make(map[string](*AggEvaluateContext))
+	}
+	if _, ok := n.ContextPerGroup[n.CurrentGroup]; !ok {
+		c := &AggEvaluateContext{}
+		if n.Distinct {
+			c.Distinct = CreateAggregateDistinct(n.F, n.Distinct)
+		}
+		n.ContextPerGroup[n.CurrentGroup] = c
+	}
+	return n.ContextPerGroup[n.CurrentGroup]
+}
+
+func (n *AggregateFuncExpr) updateCount() error {
+	ctx := n.GetContext()
+	var value interface{}
+	if len(n.Args) > 0 {
+		hasNil := false
+		for _, a := range n.Args {
+			value = a.GetValue()
+			if value == nil {
+				hasNil = true
+			}
+		}
+		if hasNil {
+			return nil
+		}
+	}
+	if n.Distinct {
+		// TODO: compose values into value. For example select count(DISTINCT c1, c2) from t;
+		d, err := ctx.Distinct.IsDistinct(value)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if !d {
+			return nil
+		}
+	}
+	ctx.Count++
+	return nil
+}
+
+func (n *AggregateFuncExpr) updateFirstRow() error {
+	ctx := n.GetContext()
+	if ctx.evaluated {
+		return nil
+	}
+	if len(n.Args) != 1 {
+		return errors.New("Wrong number of args for AggFuncFirstRow")
+	}
+	ctx.Value = n.Args[0].GetValue()
+	ctx.evaluated = true
+	return nil
+}
+
+// AggFuncDetector visits Expr tree to check if it contains AggregateFuncExpr.
 type AggFuncDetector struct {
 	HasAggFunc bool
 	detecting  bool
@@ -398,6 +481,9 @@ type AggFuncDetector struct {
 
 // Enter implemets Visitor interface.
 func (a *AggFuncDetector) Enter(n Node) (node Node, skipChildren bool) {
+	defer func() {
+		a.detecting = true
+	}()
 	switch n.(type) {
 	case *AggregateFuncExpr, *GroupByClause:
 		a.HasAggFunc = true
@@ -408,7 +494,6 @@ func (a *AggFuncDetector) Enter(n Node) (node Node, skipChildren bool) {
 			return n, true
 		}
 	}
-	a.detecting = true
 	return n, a.HasAggFunc
 }
 
@@ -417,14 +502,21 @@ func (a *AggFuncDetector) Leave(n Node) (node Node, ok bool) {
 	return n, !a.HasAggFunc
 }
 
-// Visit Expr tree to set ColunmNameExpr.InAggregate to true.
+// AggregateFuncExtractor visit Expr tree.
+// It converts ColunmNameExpr to AggregateFuncExpr and collects AggregateFuncExpr.
 type AggregateFuncExtractor struct {
 	inAggregateFuncExpr bool
-	AggFuncs            []*AggregateFuncExpr
+	inSelectFields      bool
+	// AggFuncs is the collected AggregateFuncExprs.
+	AggFuncs  []*AggregateFuncExpr
+	detecting bool
 }
 
 // Enter implemets Visitor interface.
 func (a *AggregateFuncExtractor) Enter(n Node) (node Node, skipChildren bool) {
+	defer func() {
+		a.detecting = true
+	}()
 	switch v := n.(type) {
 	case *AggregateFuncExpr:
 		a.inAggregateFuncExpr = true
@@ -432,7 +524,9 @@ func (a *AggregateFuncExtractor) Enter(n Node) (node Node, skipChildren bool) {
 	case *SelectStmt, *InsertStmt, *DeleteStmt, *UpdateStmt:
 		// Enter a new context, skip it.
 		// For example: select sum(c) + c + exists(select c from t) from t;
-		return n, true
+		if a.detecting {
+			return n, true
+		}
 	}
 	return n, false
 }
@@ -449,9 +543,10 @@ func (a *AggregateFuncExtractor) Leave(n Node) (node Node, ok bool) {
 			// The c in sum() should be evaluated for each row.
 			// The c after plus should be evaluated only once.
 			agg := &AggregateFuncExpr{
-				F:    "FirstRowColumn",
-				Args: []ExprNode{n},
+				F:    AggFuncFirstRow,
+				Args: []ExprNode{n.(ExprNode)},
 			}
+			a.AggFuncs = append(a.AggFuncs, agg)
 			return agg, true
 		}
 	}
@@ -480,7 +575,7 @@ func CreateAggregateDistinct(f string, distinct bool) *AggregateDistinct {
 	return a
 }
 
-// Check whether v is distinct or not, return true for distinct
+// IsDistinct checks whether v is distinct or not. It returns true for distinct value.
 func (a *AggregateDistinct) IsDistinct(v ...interface{}) (bool, error) {
 	// no distinct flag
 	if a.Distinct == nil {
@@ -505,6 +600,7 @@ func (a *AggregateDistinct) IsDistinct(v ...interface{}) (bool, error) {
 	return true, nil
 }
 
+// Clear does cleanup job.
 func (a *AggregateDistinct) Clear() {
 	if a.Distinct == nil {
 		return
@@ -517,8 +613,10 @@ func (a *AggregateDistinct) Clear() {
 	a.Distinct, _ = memkv.CreateTemp(true)
 }
 
+// AggEvaluateContext is used to store intermediate result when caculation aggregate functions.
 type AggEvaluateContext struct {
-	Distinct *AggregateDistinct
-	Count    int64
-	Value    interface{}
+	Distinct  *AggregateDistinct
+	Count     int64
+	Value     interface{}
+	evaluated bool
 }

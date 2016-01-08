@@ -218,12 +218,7 @@ func (e *Evaluator) compareSubquery(v *ast.CompareSubqueryExpr) bool {
 }
 
 func (e *Evaluator) columnName(v *ast.ColumnNameExpr) bool {
-	if v.InAggregate && v.Evaluated {
-		// Evaluate only once in aggregate environment.
-		return true
-	}
 	v.SetValue(v.Refer.Expr.GetValue())
-	v.Evaluated = true
 	return true
 }
 
@@ -957,60 +952,22 @@ func parseDayInterval(value interface{}) (int64, error) {
 }
 
 func (e *Evaluator) aggregateFunc(v *ast.AggregateFuncExpr) bool {
-	if v.Context == nil {
-		v.Context = &ast.AggEvalueContext{}
-		if v.Distinct {
-			v.Context.Distinct = ast.CreateAggregateDistinct(v.F, v.Distinct)
-		}
-	}
 	name := strings.ToLower(v.F)
 	switch name {
-	case "count":
-		e.countEvalFunc(v)
+	case ast.AggFuncCount:
+		e.evalAggCount(v)
+	case ast.AggFuncFirstRow:
+		e.evalAggFirstRow(v)
 	}
 	return e.err == nil
 }
 
-func (e *Evaluator) countEvalFunc(expr *ast.AggregateFuncExpr) {
-	if e.ctx.Value(ast.AggDone) != nil {
-		expr.Done = true
-		expr.SetValue(expr.Context.Count)
-		// Do cleanup.
-		expr.Context.Count = 0
-		if expr.Distinct {
-			expr.Context.Distinct.Clear()
-		}
-		return
-	}
-	var value interface{}
-	if len(expr.Args) > 0 {
-		// TODO: consider count(*)
-		allNull := true
-		for _, a := range expr.Args {
-			a.Accept(e)
-			if e.err != nil {
-				return
-			}
-			value = a.GetValue()
-			if value != nil {
-				allNull = false
-			}
-		}
-		if allNull {
-			return
-		}
-	}
-	if expr.Distinct {
-		// TODO: compose values into value. For example select count(c1, c2) from t;
-		d, err := expr.Context.Distinct.IsDistinct(value)
-		if err != nil {
-			e.err = err
-			return
-		}
-		if !d {
-			return
-		}
-	}
-	expr.Context.Count++
-	return
+func (e *Evaluator) evalAggCount(v *ast.AggregateFuncExpr) {
+	ctx := v.GetContext()
+	v.SetValue(ctx.Count)
+}
+
+func (e *Evaluator) evalAggFirstRow(v *ast.AggregateFuncExpr) {
+	ctx := v.GetContext()
+	v.SetValue(ctx.Value)
 }

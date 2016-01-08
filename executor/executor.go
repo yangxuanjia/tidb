@@ -695,14 +695,22 @@ func (e *SortExec) Close() error {
 	return e.Src.Close()
 }
 
+// For select stmt with aggregate function but without groupby clasue,
+// We consider there is a single group with key singleGroup.
+const singleGroup = "SingleGroup"
+
 // AggregateExec represents a select fields executor.
 // TODO: Add having
 type AggregateExec struct {
-	Src          Executor
-	ResultFields []*ast.ResultField
-	executed     bool
-	ctx          context.Context
-	finish       bool
+	Src               Executor
+	ResultFields      []*ast.ResultField
+	executed          bool
+	ctx               context.Context
+	finish            bool
+	AggFuncs          []*ast.AggregateFuncExpr
+	groupMap          map[string]bool
+	groups            []string
+	currentGroupIndex int
 }
 
 // Fields implements Executor Fields interface.
@@ -712,72 +720,74 @@ func (e *AggregateExec) Fields() []*ast.ResultField {
 
 // Next implements Executor Next interface.
 func (e *AggregateExec) Next() (*Row, error) {
-	// 1. read a group
-	// 2. evaluate the fields
-	// 3. check having
-	// 4. return a row
-	if e.finish {
-		return nil, nil
-	}
 	// In this stage we consider all data from src as a single group.
 	// TODO: support group by clause.
-	for {
-		row, err := e.innerNext()
-		if err != nil {
-			return nil, errors.Trace(err)
+	if !e.executed {
+		e.groupMap = make(map[string]bool)
+		for {
+			hasMore, err := e.innerNext()
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			if !hasMore {
+				break
+			}
 		}
-		if row == nil {
-			e.finish = true
-			break
+		e.executed = true
+		if len(e.groupMap) == 0 {
+			// No group
+			e.groupMap[singleGroup] = true
+		}
+		e.groups = make([]string, 0, len(e.groupMap))
+		for gk := range e.groupMap {
+			e.groups = append(e.groups, gk)
 		}
 	}
-	// Finish read data, evalue
-	e.ctx.SetValue(ast.AggDone, true)
-	defer e.ctx.ClearValue(ast.AggDone)
-	r := &Row{
-		Data: make([]interface{}, len(e.ResultFields)),
+	if e.currentGroupIndex >= len(e.groups) {
+		return nil, nil
 	}
-
-	for i, field := range e.ResultFields {
-		val, err := evaluator.Eval(e.ctx, field.Expr)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		r.Data[i] = val
+	groupKey := e.groups[e.currentGroupIndex]
+	for _, af := range e.AggFuncs {
+		af.CurrentGroup = groupKey
 	}
-	return r, nil
+	e.currentGroupIndex++
+	return &Row{}, nil
 }
 
-func (e *AggregateExec) innerNext() (*Row, error) {
-	var rowKeys []*RowKeyEntry
+// Fetch a single row from src and update each aggregate function.
+// If the first return value is false, it means there is no more data from src.
+func (e *AggregateExec) innerNext() (bool, error) {
 	if e.Src != nil {
 		srcRow, err := e.Src.Next()
 		if err != nil {
-			return nil, errors.Trace(err)
+			return false, errors.Trace(err)
 		}
 		if srcRow == nil {
-			return nil, nil
+			return false, nil
 		}
-		rowKeys = srcRow.RowKeys
 	} else {
 		// If Src is nil, only one row should be returned.
 		if e.executed {
-			return nil, nil
+			return false, nil
 		}
 	}
 	e.executed = true
-	row := &Row{
-		RowKeys: rowKeys,
-		Data:    make([]interface{}, len(e.ResultFields)),
-	}
-	for i, field := range e.ResultFields {
-		val, err := evaluator.Eval(e.ctx, field.Expr)
-		if err != nil {
-			return nil, errors.Trace(err)
+	// TODO: evaluate groupby key and set currentgroup to each aggfunc.
+	groupKey := singleGroup
+	e.groupMap[groupKey] = true
+	for _, af := range e.AggFuncs {
+		if len(af.Args) > 0 {
+			for _, arg := range af.Args {
+				_, err := evaluator.Eval(e.ctx, arg)
+				if err != nil {
+					return false, errors.Trace(err)
+				}
+			}
 		}
-		row.Data[i] = val
+		af.CurrentGroup = groupKey
+		af.Update()
 	}
-	return row, nil
+	return true, nil
 }
 
 // Close implements Executor Close interface.
