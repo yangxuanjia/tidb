@@ -236,6 +236,31 @@ func (e *ShowExec) fetchShowIndex() error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	if tb.Meta().PKIsHandle {
+		var pkCol *table.Column
+		for _, col := range tb.Cols() {
+			if mysql.HasPriKeyFlag(col.Flag) {
+				pkCol = col
+				break
+			}
+		}
+		data := types.MakeDatums(
+			tb.Meta().Name.O, // Table
+			0,                // Non_unique
+			"PRIMARY",        // Key_name
+			1,                // Seq_in_index
+			pkCol.Name.O,     // Column_name
+			"utf8_bin",       // Colation
+			0,                // Cardinality
+			nil,              // Sub_part
+			nil,              // Packed
+			"",               // Null
+			"BTREE",          // Index_type
+			"",               // Comment
+			"",               // Index_comment
+		)
+		e.rows = append(e.rows, &Row{Data: data})
+	}
 	for _, idx := range tb.Indices() {
 		for i, col := range idx.Meta().Columns {
 			nonUniq := 1
@@ -386,10 +411,10 @@ func (e *ShowExec) fetchShowCreateTable() error {
 	if pkCol != nil {
 		// If PKIsHanle, pk info is not in tb.Indices(). We should handle it here.
 		buf.WriteString(",\n")
-		buf.WriteString(fmt.Sprintf(" PRIMARY KEY (`%s`) ", pkCol.Name.O))
+		buf.WriteString(fmt.Sprintf(" PRIMARY KEY (`%s`)", pkCol.Name.O))
 	}
 
-	if len(tb.Indices()) > 0 {
+	if len(tb.Indices()) > 0 || len(tb.Meta().ForeignKeys) > 0 {
 		buf.WriteString(",\n")
 	}
 
@@ -413,12 +438,15 @@ func (e *ShowExec) fetchShowCreateTable() error {
 		}
 	}
 
+	if len(tb.Indices()) > 0 && len(tb.Meta().ForeignKeys) > 0 {
+		buf.WriteString(",\n")
+	}
+
 	for _, fk := range tb.Meta().ForeignKeys {
 		if fk.State != model.StatePublic {
 			continue
 		}
 
-		buf.WriteString("\n")
 		cols := make([]string, 0, len(fk.Cols))
 		for _, c := range fk.Cols {
 			cols = append(cols, c.L)

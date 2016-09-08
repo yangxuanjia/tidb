@@ -39,7 +39,7 @@ func (s *testSuite) TestShow(c *C) {
 	row := result.Rows()[0]
 	// For issue https://github.com/pingcap/tidb/issues/1061
 	expectedRow := []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  `c1` int(11) DEFAULT NULL COMMENT 'c1_comment',\n  `c2` int(11) DEFAULT NULL,\n  `c3` int(11) DEFAULT '1',\n PRIMARY KEY (`id`) \n) ENGINE=InnoDB DEFAULT CHARSET=utf8 AUTO_INCREMENT=28934 COMMENT='table_comment'"}
+		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  `c1` int(11) DEFAULT NULL COMMENT 'c1_comment',\n  `c2` int(11) DEFAULT NULL,\n  `c3` int(11) DEFAULT '1',\n PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 AUTO_INCREMENT=28934 COMMENT='table_comment'"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -49,14 +49,22 @@ func (s *testSuite) TestShow(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 
 	// Test case for index type and comment
-	tk.MustExec(`create table show_index (c int, index cIdx using hash (c) comment "index_comment_for_cIdx");`)
+	tk.MustExec(`create table show_index (id int, c int, primary key (id), index cIdx using hash (c) comment "index_comment_for_cIdx");`)
 	testSQL = "SHOW index from show_index;"
 	result = tk.MustQuery(testSQL)
-	c.Check(result.Rows(), HasLen, 1)
+	c.Check(result.Rows(), HasLen, 2)
+	expectedRow = []interface{}{
+		"show_index", int64(0), "PRIMARY", int64(1), "id", "utf8_bin",
+		int64(0), nil, nil, "", "BTREE", "", ""}
+	row = result.Rows()[0]
+	c.Check(row, HasLen, len(expectedRow))
+	for i, r := range row {
+		c.Check(r, Equals, expectedRow[i])
+	}
 	expectedRow = []interface{}{
 		"show_index", int64(1), "cIdx", int64(1), "c", "utf8_bin",
 		int64(0), nil, nil, "YES", "HASH", "", "index_comment_for_cIdx"}
-	row = result.Rows()[0]
+	row = result.Rows()[1]
 	c.Check(row, HasLen, len(expectedRow))
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
@@ -109,7 +117,7 @@ func (s *testSuite) TestForeignKeyInShowCreateTable(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 	row := result.Rows()[0]
 	expectedRow := []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n PRIMARY KEY (`id`) \n  CONSTRAINT `fk` FOREIGN KEY (`id`) REFERENCES `t1` (`id`) ON DELETE CASCADE ON UPDATE CASCADE\n) ENGINE=InnoDB"}
+		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n PRIMARY KEY (`id`),\n  CONSTRAINT `fk` FOREIGN KEY (`id`) REFERENCES `t1` (`id`) ON DELETE CASCADE ON UPDATE CASCADE\n) ENGINE=InnoDB"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -121,7 +129,7 @@ func (s *testSuite) TestForeignKeyInShowCreateTable(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 	row = result.Rows()[0]
 	expectedRow = []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n PRIMARY KEY (`id`) \n) ENGINE=InnoDB"}
+		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n PRIMARY KEY (`id`)\n) ENGINE=InnoDB"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -133,7 +141,7 @@ func (s *testSuite) TestForeignKeyInShowCreateTable(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 	row = result.Rows()[0]
 	expectedRow = []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n PRIMARY KEY (`id`) \n  CONSTRAINT `fk` FOREIGN KEY (`id`) REFERENCES `t1` (`id`) ON DELETE CASCADE ON UPDATE CASCADE\n) ENGINE=InnoDB"}
+		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n PRIMARY KEY (`id`),\n  CONSTRAINT `fk` FOREIGN KEY (`id`) REFERENCES `t1` (`id`) ON DELETE CASCADE ON UPDATE CASCADE\n) ENGINE=InnoDB"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}

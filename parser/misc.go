@@ -21,10 +21,6 @@ import (
 	"github.com/pingcap/tidb/util/hack"
 )
 
-func isWhitespace(ch rune) bool {
-	return ch == ' ' || ch == '\t' || ch == '\n'
-}
-
 func isLetter(ch rune) bool {
 	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
 }
@@ -158,6 +154,8 @@ var tokenMap = map[string]int{
 	"BYTE":                byteType,
 	"CASE":                caseKwd,
 	"CAST":                cast,
+	"CEIL":                ceil,
+	"CEILING":             ceiling,
 	"CHARACTER":           character,
 	"CHARSET":             charsetKwd,
 	"CHECK":               check,
@@ -178,6 +176,7 @@ var tokenMap = map[string]int{
 	"CONNECTION":          connection,
 	"CONNECTION_ID":       connectionID,
 	"CONSTRAINT":          constraint,
+	"CONSISTENT":          consistent,
 	"CONVERT":             convert,
 	"COUNT":               count,
 	"CREATE":              create,
@@ -239,6 +238,7 @@ var tokenMap = map[string]int{
 	"FROM":                from,
 	"FULL":                full,
 	"FULLTEXT":            fulltext,
+	"FLUSH":               flush,
 	"GET_LOCK":            getLock,
 	"GLOBAL":              global,
 	"GRANT":               grant,
@@ -251,6 +251,7 @@ var tokenMap = map[string]int{
 	"HIGH_PRIORITY":       highPriority,
 	"HOUR":                hour,
 	"HEX":                 hex,
+	"UNHEX":               unhex,
 	"IDENTIFIED":          identified,
 	"IGNORE":              ignore,
 	"IF":                  ifKwd,
@@ -298,6 +299,7 @@ var tokenMap = map[string]int{
 	"NAMES":               names,
 	"NATIONAL":            national,
 	"NOT":                 not,
+	"NO_WRITE_TO_BINLOG":  noWriteToBinLog,
 	"NULL":                null,
 	"NULLIF":              nullIf,
 	"OFFSET":              offset,
@@ -344,6 +346,7 @@ var tokenMap = map[string]int{
 	"SHOW":                show,
 	"SLEEP":               sleep,
 	"SIGNED":              signed,
+	"SNAPSHOT":            snapshot,
 	"SOME":                some,
 	"SPACE":               space,
 	"START":               start,
@@ -390,6 +393,7 @@ var tokenMap = map[string]int{
 	"WEEKOFYEAR":          weekofyear,
 	"WHEN":                when,
 	"WHERE":               where,
+	"WITH":                with,
 	"WRITE":               write,
 	"XOR":                 xor,
 	"YEARWEEK":            yearweek,
