@@ -13,51 +13,26 @@
 
 package executor
 
-import (
-	"encoding/json"
-
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/expression"
-	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/util/types"
-)
-
 // ExplainExec represents an explain executor.
-// See https://dev.mysql.com/doc/refman/5.7/en/explain-output.html
 type ExplainExec struct {
-	StmtPlan  plan.Plan
-	schema    expression.Schema
-	evaluated bool
-}
+	baseExecutor
 
-// Schema implements Executor Schema interface.
-func (e *ExplainExec) Schema() expression.Schema {
-	return e.schema
-}
-
-// Fields implements Executor Fields interface.
-func (e *ExplainExec) Fields() []*ast.ResultField {
-	return nil
+	rows   []Row
+	cursor int
 }
 
 // Next implements Execution Next interface.
-func (e *ExplainExec) Next() (*Row, error) {
-	if e.evaluated {
+func (e *ExplainExec) Next() (Row, error) {
+	if e.cursor >= len(e.rows) {
 		return nil, nil
 	}
-	e.evaluated = true
-	explain, err := json.MarshalIndent(e.StmtPlan, "", "    ")
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	row := &Row{
-		Data: types.MakeDatums("EXPLAIN", string(explain)),
-	}
+	row := e.rows[e.cursor]
+	e.cursor++
 	return row, nil
 }
 
-// Close implements Executor Close interface.
+// Close implements the Executor Close interface.
 func (e *ExplainExec) Close() error {
+	e.rows = nil
 	return nil
 }

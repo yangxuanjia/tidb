@@ -14,19 +14,21 @@
 package executor
 
 import (
+	"math"
 	"sort"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/sqlexec"
+	goctx "golang.org/x/net/context"
 )
 
 var (
@@ -66,53 +68,49 @@ func (e *paramMarkerExtractor) Leave(in ast.Node) (ast.Node, bool) {
 	return in, true
 }
 
-// Prepared represents a prepared statement.
-type Prepared struct {
-	Stmt          ast.StmtNode
-	Params        []*ast.ParamMarkerExpr
-	SchemaVersion int64
-}
-
 // PrepareExec represents a PREPARE executor.
 type PrepareExec struct {
+	baseExecutor
+
 	IS      infoschema.InfoSchema
-	Ctx     context.Context
 	Name    string
 	SQLText string
 
-	ID           uint32
-	ResultFields []*ast.ResultField
-	ParamCount   int
-	Err          error
+	ID         uint32
+	ParamCount int
+	Err        error
+	Fields     []*ast.ResultField
 }
 
-// Schema implements Executor Schema interface.
-func (e *PrepareExec) Schema() expression.Schema {
-	// Will never be called.
-	return nil
+// NewPrepareExec creates a new PrepareExec.
+func NewPrepareExec(ctx context.Context, is infoschema.InfoSchema, sqlTxt string) *PrepareExec {
+	return &PrepareExec{
+		baseExecutor: newBaseExecutor(nil, ctx),
+		IS:           is,
+		SQLText:      sqlTxt,
+	}
 }
 
-// Fields implements Executor Fields interface.
-func (e *PrepareExec) Fields() []*ast.ResultField {
-	// returns nil to indicate prepare will not return Recordset.
-	return nil
-}
-
-// Next implements Executor Next interface.
-func (e *PrepareExec) Next() (*Row, error) {
+// Next implements the Executor Next interface.
+func (e *PrepareExec) Next() (Row, error) {
 	e.DoPrepare()
 	return nil, e.Err
 }
 
-// Close implements plan.Plan Close interface.
+// Close implements the Executor Close interface.
 func (e *PrepareExec) Close() error {
+	return nil
+}
+
+// Open implements the Executor Open interface.
+func (e *PrepareExec) Open(goCtx goctx.Context) error {
 	return nil
 }
 
 // DoPrepare prepares the statement, it can be called multiple times without
 // side effect.
 func (e *PrepareExec) DoPrepare() {
-	vars := variable.GetSessionVars(e.Ctx)
+	vars := e.ctx.GetSessionVars()
 	if e.ID != 0 {
 		// Must be the case when we retry a prepare.
 		// Make sure it is idempotent.
@@ -121,12 +119,12 @@ func (e *PrepareExec) DoPrepare() {
 			return
 		}
 	}
-	charset, collation := variable.GetCharsetInfo(e.Ctx)
+	charset, collation := vars.GetCharsetInfo()
 	var (
 		stmts []ast.StmtNode
 		err   error
 	)
-	if sqlParser, ok := e.Ctx.(sqlexec.SQLParser); ok {
+	if sqlParser, ok := e.ctx.(sqlexec.SQLParser); ok {
 		stmts, err = sqlParser.ParseSQL(e.SQLText, charset, collation)
 	} else {
 		stmts, err = parser.New().Parse(e.SQLText, charset, collation)
@@ -136,12 +134,21 @@ func (e *PrepareExec) DoPrepare() {
 		return
 	}
 	if len(stmts) != 1 {
-		e.Err = ErrPrepareMulti
+		e.Err = errors.Trace(ErrPrepareMulti)
 		return
 	}
 	stmt := stmts[0]
+	if _, ok := stmt.(ast.DDLNode); ok {
+		e.Err = errors.Trace(ErrPrepareDDL)
+		return
+	}
 	var extractor paramMarkerExtractor
 	stmt.Accept(&extractor)
+	err = plan.Preprocess(e.ctx, stmt, e.IS, true)
+	if err != nil {
+		e.Err = errors.Trace(err)
+		return
+	}
 
 	// The parameter markers are appended in visiting order, which may not
 	// be the same as the position order in the query string. We need to
@@ -149,19 +156,24 @@ func (e *PrepareExec) DoPrepare() {
 	sorter := &paramMarkerSorter{markers: extractor.markers}
 	sort.Sort(sorter)
 	e.ParamCount = len(sorter.markers)
-	prepared := &Prepared{
+	for i := 0; i < e.ParamCount; i++ {
+		sorter.markers[i].Order = i
+	}
+	prepared := &plan.Prepared{
 		Stmt:          stmt,
 		Params:        sorter.markers,
 		SchemaVersion: e.IS.SchemaMetaVersion(),
 	}
+	prepared.UseCache = plan.PreparedPlanCacheEnabled && plan.Cacheable(stmt)
 
-	err = plan.PrepareStmt(e.IS, e.Ctx, stmt)
+	// We try to build the real statement of preparedStmt.
+	for i := range prepared.Params {
+		prepared.Params[i].SetDatum(types.NewIntDatum(0))
+	}
+	_, err = plan.BuildLogicalPlan(e.ctx, stmt, e.IS)
 	if err != nil {
 		e.Err = errors.Trace(err)
 		return
-	}
-	if resultSetNode, ok := stmt.(ast.ResultSetNode); ok {
-		e.ResultFields = resultSetNode.GetResultFields()
 	}
 
 	if e.ID == 0 {
@@ -174,133 +186,185 @@ func (e *PrepareExec) DoPrepare() {
 }
 
 // ExecuteExec represents an EXECUTE executor.
-// It executes a prepared statement.
+// It cannot be executed by itself, all it needs to do is to build
+// another Executor from a prepared statement.
 type ExecuteExec struct {
+	baseExecutor
+
 	IS        infoschema.InfoSchema
-	Ctx       context.Context
 	Name      string
-	UsingVars []ast.ExprNode
+	UsingVars []expression.Expression
 	ID        uint32
 	StmtExec  Executor
 	Stmt      ast.StmtNode
+	Plan      plan.Plan
 }
 
-// Schema implements Executor Schema interface.
-func (e *ExecuteExec) Schema() expression.Schema {
-	// Will never be called.
-	return nil
-}
-
-// Fields implements Executor Fields interface.
-func (e *ExecuteExec) Fields() []*ast.ResultField {
-	// Will never be called.
-	return nil
-}
-
-// Next implements Executor Next interface.
-func (e *ExecuteExec) Next() (*Row, error) {
+// Next implements the Executor Next interface.
+func (e *ExecuteExec) Next() (Row, error) {
 	// Will never be called.
 	return nil, nil
 }
 
-// Close implements plan.Plan Close interface.
+// Open implements the Executor Open interface.
+func (e *ExecuteExec) Open(goCtx goctx.Context) error {
+	return nil
+}
+
+// Close implements Executor Close interface.
 func (e *ExecuteExec) Close() error {
 	// Will never be called.
 	return nil
 }
 
 // Build builds a prepared statement into an executor.
+// After Build, e.StmtExec will be used to do the real execution.
 func (e *ExecuteExec) Build() error {
-	vars := variable.GetSessionVars(e.Ctx)
-	if e.Name != "" {
-		e.ID = vars.PreparedStmtNameToID[e.Name]
+	var err error
+	if IsPointGetWithPKOrUniqueKeyByAutoCommit(e.ctx, e.Plan) {
+		err = e.ctx.InitTxnWithStartTS(math.MaxUint64)
+	} else {
+		err = e.ctx.ActivePendingTxn()
 	}
-	v := vars.PreparedStmts[e.ID]
-	if v == nil {
-		return ErrStmtNotFound
-	}
-	prepared := v.(*Prepared)
-
-	if len(prepared.Params) != len(e.UsingVars) {
-		return ErrWrongParamCount
-	}
-
-	for i, usingVar := range e.UsingVars {
-		val, err := evaluator.Eval(e.Ctx, usingVar)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		prepared.Params[i].SetDatum(val)
-	}
-
-	ast.ResetEvaluatedFlag(prepared.Stmt)
-	if prepared.SchemaVersion != e.IS.SchemaMetaVersion() {
-		// If the schema version has changed we need to prepare it again,
-		// if this time it failed, the real reason for the error is schema changed.
-		err := plan.PrepareStmt(e.IS, e.Ctx, prepared.Stmt)
-		if err != nil {
-			return ErrSchemaChanged.Gen("Schema change casued error: %s", err.Error())
-		}
-		prepared.SchemaVersion = e.IS.SchemaMetaVersion()
-	}
-	p, err := plan.Optimize(e.Ctx, prepared.Stmt, e.IS)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	b := newExecutorBuilder(e.Ctx, e.IS)
-	stmtExec := b.build(p)
+	b := newExecutorBuilder(e.ctx, e.IS, kv.PriorityNormal)
+	stmtExec := b.build(e.Plan)
 	if b.err != nil {
 		return errors.Trace(b.err)
 	}
 	e.StmtExec = stmtExec
-	e.Stmt = prepared.Stmt
+	ResetStmtCtx(e.ctx, e.Stmt)
+	stmtCount(e.Stmt, e.Plan, e.ctx.GetSessionVars().InRestrictedSQL)
 	return nil
 }
 
 // DeallocateExec represent a DEALLOCATE executor.
 type DeallocateExec struct {
+	baseExecutor
+
 	Name string
-	ctx  context.Context
 }
 
-// Schema implements Executor Schema interface.
-func (e *DeallocateExec) Schema() expression.Schema {
-	// Will never be called.
-	return nil
-}
-
-// Fields implements Executor Fields interface.
-func (e *DeallocateExec) Fields() []*ast.ResultField {
-	return nil
-}
-
-// Next implements Executor Next interface.
-func (e *DeallocateExec) Next() (*Row, error) {
-	vars := variable.GetSessionVars(e.ctx)
+// Next implements the Executor Next interface.
+func (e *DeallocateExec) Next() (Row, error) {
+	vars := e.ctx.GetSessionVars()
 	id, ok := vars.PreparedStmtNameToID[e.Name]
 	if !ok {
-		return nil, ErrStmtNotFound
+		return nil, errors.Trace(plan.ErrStmtNotFound)
 	}
 	delete(vars.PreparedStmtNameToID, e.Name)
 	delete(vars.PreparedStmts, id)
 	return nil, nil
 }
 
-// Close implements plan.Plan Close interface.
+// Close implements Executor Close interface.
 func (e *DeallocateExec) Close() error {
 	return nil
 }
 
+// Open implements Executor Open interface.
+func (e *DeallocateExec) Open(goCtx goctx.Context) error {
+	return nil
+}
+
 // CompileExecutePreparedStmt compiles a session Execute command to a stmt.Statement.
-func CompileExecutePreparedStmt(ctx context.Context, ID uint32, args ...interface{}) ast.Statement {
-	execPlan := &plan.Execute{ID: ID}
-	execPlan.UsingVars = make([]ast.ExprNode, len(args))
+func CompileExecutePreparedStmt(ctx context.Context, ID uint32, args ...interface{}) (ast.Statement, error) {
+	execStmt := &ast.ExecuteStmt{ExecID: ID}
+	execStmt.UsingVars = make([]ast.ExprNode, len(args))
 	for i, val := range args {
-		execPlan.UsingVars[i] = ast.NewValueExpr(val)
+		execStmt.UsingVars[i] = ast.NewValueExpr(val)
 	}
-	sa := &statement{
-		is:   sessionctx.GetDomain(ctx).InfoSchema(),
-		plan: execPlan,
+	is := GetInfoSchema(ctx)
+	execPlan, err := plan.Optimize(ctx, execStmt, is)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
-	return sa
+
+	stmt := &ExecStmt{
+		InfoSchema: GetInfoSchema(ctx),
+		Plan:       execPlan,
+		StmtNode:   execStmt,
+		Ctx:        ctx,
+	}
+	if prepared, ok := ctx.GetSessionVars().PreparedStmts[ID].(*plan.Prepared); ok {
+		stmt.Text = prepared.Stmt.Text()
+	}
+	return stmt, nil
+}
+
+// ResetStmtCtx resets the StmtContext.
+// Before every execution, we must clear statement context.
+func ResetStmtCtx(ctx context.Context, s ast.StmtNode) {
+	sessVars := ctx.GetSessionVars()
+	sc := new(stmtctx.StatementContext)
+	sc.TimeZone = sessVars.GetTimeZone()
+
+	switch stmt := s.(type) {
+	case *ast.UpdateStmt:
+		sc.IgnoreTruncate = false
+		sc.OverflowAsWarning = false
+		sc.TruncateAsWarning = !sessVars.StrictSQLMode || stmt.IgnoreErr
+		sc.InUpdateOrDeleteStmt = true
+		sc.DividedByZeroAsWarning = stmt.IgnoreErr
+		sc.IgnoreZeroInDate = !sessVars.StrictSQLMode || stmt.IgnoreErr
+	case *ast.DeleteStmt:
+		sc.IgnoreTruncate = false
+		sc.OverflowAsWarning = false
+		sc.TruncateAsWarning = !sessVars.StrictSQLMode || stmt.IgnoreErr
+		sc.InUpdateOrDeleteStmt = true
+		sc.DividedByZeroAsWarning = stmt.IgnoreErr
+		sc.IgnoreZeroInDate = !sessVars.StrictSQLMode || stmt.IgnoreErr
+	case *ast.InsertStmt:
+		sc.IgnoreTruncate = false
+		sc.TruncateAsWarning = !sessVars.StrictSQLMode || stmt.IgnoreErr
+		sc.InInsertStmt = true
+		sc.DividedByZeroAsWarning = stmt.IgnoreErr
+		sc.IgnoreZeroInDate = !sessVars.StrictSQLMode || stmt.IgnoreErr
+	case *ast.CreateTableStmt, *ast.AlterTableStmt:
+		// Make sure the sql_mode is strict when checking column default value.
+		sc.IgnoreTruncate = false
+		sc.OverflowAsWarning = false
+		sc.TruncateAsWarning = false
+	case *ast.LoadDataStmt:
+		sc.IgnoreTruncate = false
+		sc.OverflowAsWarning = false
+		sc.TruncateAsWarning = !sessVars.StrictSQLMode
+	case *ast.SelectStmt:
+		sc.InSelectStmt = true
+
+		// see https://dev.mysql.com/doc/refman/5.7/en/sql-mode.html#sql-mode-strict
+		// said "For statements such as SELECT that do not change data, invalid values
+		// generate a warning in strict mode, not an error."
+		// and https://dev.mysql.com/doc/refman/5.7/en/out-of-range-and-overflow.html
+		sc.OverflowAsWarning = true
+
+		// Return warning for truncate error in selection.
+		sc.IgnoreTruncate = false
+		sc.TruncateAsWarning = true
+		sc.IgnoreZeroInDate = true
+		if opts := stmt.SelectStmtOpts; opts != nil {
+			sc.Priority = opts.Priority
+			sc.NotFillCache = !opts.SQLCache
+		}
+		sc.PadCharToFullLength = ctx.GetSessionVars().SQLMode.HasPadCharToFullLengthMode()
+	default:
+		sc.IgnoreTruncate = true
+		sc.OverflowAsWarning = false
+		if show, ok := s.(*ast.ShowStmt); ok {
+			if show.Tp == ast.ShowWarnings {
+				sc.InShowWarning = true
+				sc.SetWarnings(sessVars.StmtCtx.GetWarnings())
+			}
+		}
+		sc.IgnoreZeroInDate = true
+	}
+	if sessVars.LastInsertID > 0 {
+		sessVars.PrevLastInsertID = sessVars.LastInsertID
+		sessVars.LastInsertID = 0
+	}
+	sessVars.ResetPrevAffectedRows()
+	sessVars.InsertID = 0
+	sessVars.StmtCtx = sc
 }

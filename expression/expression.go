@@ -14,386 +14,113 @@
 package expression
 
 import (
-	"bytes"
-	"encoding/json"
+	goJSON "encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/evaluator"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/util/codec"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/types/json"
 )
+
+// EvalAstExpr evaluates ast expression directly.
+var EvalAstExpr func(expr ast.ExprNode, ctx context.Context) (types.Datum, error)
 
 // Expression represents all scalar expression in SQL.
 type Expression interface {
 	fmt.Stringer
-	json.Marshaler
-	// Eval evaluates an expression through a row.
-	Eval(row []types.Datum, ctx context.Context) (types.Datum, error)
+	goJSON.Marshaler
 
-	// Get the expression return type.
+	// Eval evaluates an expression through a row.
+	Eval(row types.Row) (types.Datum, error)
+
+	// EvalInt returns the int64 representation of expression.
+	EvalInt(row types.Row, sc *stmtctx.StatementContext) (val int64, isNull bool, err error)
+
+	// EvalReal returns the float64 representation of expression.
+	EvalReal(row types.Row, sc *stmtctx.StatementContext) (val float64, isNull bool, err error)
+
+	// EvalString returns the string representation of expression.
+	EvalString(row types.Row, sc *stmtctx.StatementContext) (val string, isNull bool, err error)
+
+	// EvalDecimal returns the decimal representation of expression.
+	EvalDecimal(row types.Row, sc *stmtctx.StatementContext) (val *types.MyDecimal, isNull bool, err error)
+
+	// EvalTime returns the DATE/DATETIME/TIMESTAMP representation of expression.
+	EvalTime(row types.Row, sc *stmtctx.StatementContext) (val types.Time, isNull bool, err error)
+
+	// EvalDuration returns the duration representation of expression.
+	EvalDuration(row types.Row, sc *stmtctx.StatementContext) (val types.Duration, isNull bool, err error)
+
+	// EvalJSON returns the JSON representation of expression.
+	EvalJSON(row types.Row, sc *stmtctx.StatementContext) (val json.JSON, isNull bool, err error)
+
+	// GetType gets the type that the expression returns.
 	GetType() *types.FieldType
 
-	// DeepCopy copies an expression totally.
-	DeepCopy() Expression
+	// Clone copies an expression totally.
+	Clone() Expression
 
 	// HashCode create the hashcode for expression
 	HashCode() []byte
+
+	// Equal checks whether two expressions are equal.
+	Equal(e Expression, ctx context.Context) bool
+
+	// IsCorrelated checks if this expression has correlated key.
+	IsCorrelated() bool
+
+	// Decorrelate try to decorrelate the expression by schema.
+	Decorrelate(schema *Schema) Expression
+
+	// ResolveIndices resolves indices by the given schema.
+	ResolveIndices(schema *Schema)
+
+	// ExplainInfo returns operator information to be explained.
+	ExplainInfo() string
 }
 
-// EvalBool evaluates expression to a boolean value.
-func EvalBool(expr Expression, row []types.Datum, ctx context.Context) (bool, error) {
-	data, err := expr.Eval(row, ctx)
-	if err != nil {
-		return false, errors.Trace(err)
+// CNFExprs stands for a CNF expression.
+type CNFExprs []Expression
+
+// Clone clones itself.
+func (e CNFExprs) Clone() CNFExprs {
+	cnf := make(CNFExprs, 0, len(e))
+	for _, expr := range e {
+		cnf = append(cnf, expr.Clone())
 	}
-	if data.IsNull() {
-		return false, nil
-	}
-
-	i, err := data.ToBool()
-	if err != nil {
-		return false, errors.Trace(err)
-	}
-	return i != 0, nil
+	return cnf
 }
 
-// Column represents a column.
-type Column struct {
-	FromID  string
-	ColName model.CIStr
-	DBName  model.CIStr
-	TblName model.CIStr
-	RetType *types.FieldType
-	// Position means the position of this column that appears in the select fields.
-	// e.g. SELECT name as id , 1 - id as id , 1 + name as id, name as id from src having id = 1;
-	// There are four ids in the same schema, so you can't identify the column through the FromID and ColName.
-	Position int
-	// IsAggOrSubq means if this column is referenced to a Aggregation column or a Subquery column.
-	// If so, this column's name will be the plain sql text.
-	IsAggOrSubq bool
-
-	// only used during execution
-	Index      int
-	Correlated bool
-	data       *types.Datum
-}
-
-// Equal checks if two columns are equal
-func (col *Column) Equal(expr Expression) bool {
-	if newCol, ok := expr.(*Column); ok {
-		return newCol.FromID == col.FromID && newCol.Position == col.Position
-	}
-	return false
-}
-
-// String implements Stringer interface.
-func (col *Column) String() string {
-	result := col.ColName.L
-	if col.TblName.L != "" {
-		result = col.TblName.L + "." + result
-	}
-	if col.DBName.L != "" {
-		result = col.DBName.L + "." + result
-	}
-	return result
-}
-
-// MarshalJSON implements json.Marshaler interface.
-func (col *Column) MarshalJSON() ([]byte, error) {
-	buffer := bytes.NewBufferString(fmt.Sprintf("\"%s\"", col))
-	return buffer.Bytes(), nil
-}
-
-// SetValue sets value for correlated columns.
-func (col *Column) SetValue(d *types.Datum) {
-	col.data = d
-}
-
-// GetType implements Expression interface.
-func (col *Column) GetType() *types.FieldType {
-	return col.RetType
-}
-
-// Eval implements Expression interface.
-func (col *Column) Eval(row []types.Datum, _ context.Context) (types.Datum, error) {
-	if col.Correlated {
-		return *col.data, nil
-	}
-	return row[col.Index], nil
-}
-
-// DeepCopy implements Expression interface.
-func (col *Column) DeepCopy() Expression {
-	if col.Correlated {
-		return col
-	}
-	newCol := *col
-	return &newCol
-}
-
-// HashCode implements Expression interface.
-func (col *Column) HashCode() []byte {
-	var bytes []byte
-	bytes, _ = codec.EncodeValue(bytes, types.NewStringDatum(col.FromID), types.NewIntDatum(int64(col.Position)))
-	return bytes
-}
-
-// Schema stands for the row schema get from input.
-type Schema []*Column
-
-// String implements fmt.Stringer interface.
-func (s Schema) String() string {
-	strs := make([]string, 0, len(s))
-	for _, col := range s {
-		strs = append(strs, col.String())
-	}
-	return "[" + strings.Join(strs, ",") + "]"
-}
-
-// DeepCopy copies the total schema.
-func (s Schema) DeepCopy() Schema {
-	result := make(Schema, 0, len(s))
-	for _, col := range s {
-		newCol := *col
-		result = append(result, &newCol)
-	}
-	return result
-}
-
-// FindColumn finds an Column from schema for a ast.ColumnName. It compares the db/table/column names.
-// If there are more than one result, it will raise ambiguous error.
-func (s Schema) FindColumn(astCol *ast.ColumnName) (*Column, error) {
-	dbName, tblName, colName := astCol.Schema, astCol.Table, astCol.Name
-	idx := -1
-	for i, col := range s {
-		if (dbName.L == "" || dbName.L == col.DBName.L) &&
-			(tblName.L == "" || tblName.L == col.TblName.L) &&
-			(colName.L == col.ColName.L) {
-			if idx == -1 {
-				idx = i
-			} else {
-				return nil, errors.Errorf("Column %s is ambiguous", col.String())
-			}
-		}
-	}
-	if idx == -1 {
-		return nil, nil
-	}
-	return s[idx], nil
-}
-
-// InitIndices sets indices for columns in schema.
-func (s Schema) InitIndices() {
-	for i, c := range s {
-		c.Index = i
-	}
-}
-
-// RetrieveColumn retrieves column in expression from the columns in schema.
-func (s Schema) RetrieveColumn(col *Column) *Column {
-	index := s.GetIndex(col)
-	if index != -1 {
-		return s[index]
-	}
-	return nil
-}
-
-// GetIndex finds the index for a column.
-func (s Schema) GetIndex(col *Column) int {
-	for i, c := range s {
-		if c.FromID == col.FromID && c.Position == col.Position {
-			return i
-		}
-	}
-	return -1
-}
-
-// ScalarFunction is the function that returns a value.
-type ScalarFunction struct {
-	Args     []Expression
-	FuncName model.CIStr
-	// TODO: Implement type inference here, now we use ast's return type temporarily.
-	RetType   *types.FieldType
-	Function  evaluator.BuiltinFunc
-	ArgValues []types.Datum
-}
-
-// String implements fmt.Stringer interface.
-func (sf *ScalarFunction) String() string {
-	result := sf.FuncName.L + "("
-	for i, arg := range sf.Args {
-		result += arg.String()
-		if i+1 != len(sf.Args) {
-			result += ", "
-		}
-	}
-	result += ")"
-	return result
-}
-
-// MarshalJSON implements json.Marshaler interface.
-func (sf *ScalarFunction) MarshalJSON() ([]byte, error) {
-	buffer := bytes.NewBufferString(fmt.Sprintf("\"%s\"", sf))
-	return buffer.Bytes(), nil
-}
-
-// NewFunction creates a new scalar function or constant.
-func NewFunction(funcName string, retType *types.FieldType, args ...Expression) (Expression, error) {
-	_, canConstantFolding := evaluator.DynamicFuncs[funcName]
-	canConstantFolding = !canConstantFolding
-
-	f, ok := evaluator.Funcs[funcName]
-	if !ok {
-		return nil, errors.Errorf("Function %s is not implemented.", funcName)
-	}
-
-	if len(args) < f.MinArgs || (f.MaxArgs != -1 && len(args) > f.MaxArgs) {
-		return nil, evaluator.ErrInvalidOperation.Gen("number of function arguments must in [%d, %d].",
-			f.MinArgs, f.MaxArgs)
-	}
-
-	datums := make([]types.Datum, 0, len(args))
-
-	for i := 0; i < len(args) && canConstantFolding; i++ {
-		if v, ok := args[i].(*Constant); ok {
-			datums = append(datums, types.NewDatum(v.Value.GetValue()))
-		} else {
-			canConstantFolding = false
-		}
-	}
-
-	if canConstantFolding {
-		fn := f.F
-		newArgs, err := fn(datums, nil)
+// EvalBool evaluates expression list to a boolean value.
+func EvalBool(exprList CNFExprs, row types.Row, ctx context.Context) (bool, error) {
+	for _, expr := range exprList {
+		data, err := expr.Eval(row)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return false, errors.Trace(err)
 		}
-		return &Constant{
-			Value:   newArgs,
-			RetType: retType,
-		}, nil
-	}
-	funcArgs := make([]Expression, len(args))
-	copy(funcArgs, args)
-	return &ScalarFunction{
-		Args:      funcArgs,
-		FuncName:  model.NewCIStr(funcName),
-		RetType:   retType,
-		Function:  f.F,
-		ArgValues: make([]types.Datum, len(funcArgs))}, nil
-}
+		if data.IsNull() {
+			return false, nil
+		}
 
-//Schema2Exprs converts []*Column to []Expression.
-func Schema2Exprs(schema Schema) []Expression {
-	result := make([]Expression, 0, len(schema))
-	for _, col := range schema {
-		result = append(result, col)
-	}
-	return result
-}
-
-//ScalarFuncs2Exprs converts []*ScalarFunction to []Expression.
-func ScalarFuncs2Exprs(funcs []*ScalarFunction) []Expression {
-	result := make([]Expression, 0, len(funcs))
-	for _, col := range funcs {
-		result = append(result, col)
-	}
-	return result
-}
-
-// DeepCopy implements Expression interface.
-func (sf *ScalarFunction) DeepCopy() Expression {
-	newFunc := &ScalarFunction{
-		FuncName:  sf.FuncName,
-		Function:  sf.Function,
-		RetType:   sf.RetType,
-		ArgValues: make([]types.Datum, len(sf.Args))}
-	newFunc.Args = make([]Expression, 0, len(sf.Args))
-	for _, arg := range sf.Args {
-		newFunc.Args = append(newFunc.Args, arg.DeepCopy())
-	}
-	return newFunc
-}
-
-// GetType implements Expression interface.
-func (sf *ScalarFunction) GetType() *types.FieldType {
-	return sf.RetType
-}
-
-// Eval implements Expression interface.
-func (sf *ScalarFunction) Eval(row []types.Datum, ctx context.Context) (types.Datum, error) {
-	var err error
-	for i, arg := range sf.Args {
-		sf.ArgValues[i], err = arg.Eval(row, ctx)
+		i, err := data.ToBool(ctx.GetSessionVars().StmtCtx)
 		if err != nil {
-			return types.Datum{}, errors.Trace(err)
+			return false, errors.Trace(err)
+		}
+		if i == 0 {
+			return false, nil
 		}
 	}
-	return sf.Function(sf.ArgValues, ctx)
-}
-
-// HashCode implements Expression interface.
-func (sf *ScalarFunction) HashCode() []byte {
-	var bytes []byte
-	v := make([]types.Datum, 0, len(sf.Args)+1)
-	bytes, _ = codec.EncodeValue(bytes, types.NewStringDatum(sf.FuncName.L))
-	v = append(v, types.NewBytesDatum(bytes))
-	for _, arg := range sf.Args {
-		v = append(v, types.NewBytesDatum(arg.HashCode()))
-	}
-	bytes = bytes[:0]
-	bytes, _ = codec.EncodeValue(bytes, v...)
-	return bytes
-}
-
-// Constant stands for a constant value.
-type Constant struct {
-	Value   types.Datum
-	RetType *types.FieldType
-}
-
-// String implements fmt.Stringer interface.
-func (c *Constant) String() string {
-	return fmt.Sprintf("%v", c.Value.GetValue())
-}
-
-// MarshalJSON implements json.Marshaler interface.
-func (c *Constant) MarshalJSON() ([]byte, error) {
-	buffer := bytes.NewBufferString(fmt.Sprintf("\"%s\"", c))
-	return buffer.Bytes(), nil
-}
-
-// DeepCopy implements Expression interface.
-func (c *Constant) DeepCopy() Expression {
-	con := *c
-	return &con
-}
-
-// GetType implements Expression interface.
-func (c *Constant) GetType() *types.FieldType {
-	return c.RetType
-}
-
-// Eval implements Expression interface.
-func (c *Constant) Eval(_ []types.Datum, _ context.Context) (types.Datum, error) {
-	return c.Value, nil
-}
-
-// HashCode implements Expression interface.
-func (c *Constant) HashCode() []byte {
-	var bytes []byte
-	bytes, _ = codec.EncodeValue(bytes, c.Value)
-	return bytes
+	return true, nil
 }
 
 // composeConditionWithBinaryOp composes condition with binary operator into a balance deep tree, which benefits a lot for pb decoder/encoder.
-func composeConditionWithBinaryOp(conditions []Expression, funcName string) Expression {
+func composeConditionWithBinaryOp(ctx context.Context, conditions []Expression, funcName string) Expression {
 	length := len(conditions)
 	if length == 0 {
 		return nil
@@ -401,21 +128,45 @@ func composeConditionWithBinaryOp(conditions []Expression, funcName string) Expr
 	if length == 1 {
 		return conditions[0]
 	}
-	expr, _ := NewFunction(funcName,
+	expr := NewFunctionInternal(ctx, funcName,
 		types.NewFieldType(mysql.TypeTiny),
-		composeConditionWithBinaryOp(conditions[:length/2], funcName),
-		composeConditionWithBinaryOp(conditions[length/2:], funcName))
+		composeConditionWithBinaryOp(ctx, conditions[:length/2], funcName),
+		composeConditionWithBinaryOp(ctx, conditions[length/2:], funcName))
 	return expr
 }
 
 // ComposeCNFCondition composes CNF items into a balance deep CNF tree, which benefits a lot for pb decoder/encoder.
-func ComposeCNFCondition(conditions []Expression) Expression {
-	return composeConditionWithBinaryOp(conditions, ast.AndAnd)
+func ComposeCNFCondition(ctx context.Context, conditions ...Expression) Expression {
+	return composeConditionWithBinaryOp(ctx, conditions, ast.LogicAnd)
 }
 
 // ComposeDNFCondition composes DNF items into a balance deep DNF tree.
-func ComposeDNFCondition(conditions []Expression) Expression {
-	return composeConditionWithBinaryOp(conditions, ast.OrOr)
+func ComposeDNFCondition(ctx context.Context, conditions ...Expression) Expression {
+	return composeConditionWithBinaryOp(ctx, conditions, ast.LogicOr)
+}
+
+func extractBinaryOpItems(conditions *ScalarFunction, funcName string) []Expression {
+	var ret []Expression
+	for _, arg := range conditions.GetArgs() {
+		if sf, ok := arg.(*ScalarFunction); ok && sf.FuncName.L == funcName {
+			ret = append(ret, extractBinaryOpItems(sf, funcName)...)
+		} else {
+			ret = append(ret, arg)
+		}
+	}
+	return ret
+}
+
+// FlattenDNFConditions extracts DNF expression's leaf item.
+// e.g. or(or(a=1, a=2), or(a=3, a=4)), we'll get [a=1, a=2, a=3, a=4].
+func FlattenDNFConditions(DNFCondition *ScalarFunction) []Expression {
+	return extractBinaryOpItems(DNFCondition, ast.LogicOr)
+}
+
+// FlattenCNFConditions extracts CNF expression's leaf item.
+// e.g. and(and(a>1, a>2), and(a>3, a>4)), we'll get [a>1, a>2, a>3, a>4].
+func FlattenCNFConditions(CNFCondition *ScalarFunction) []Expression {
+	return extractBinaryOpItems(CNFCondition, ast.LogicAnd)
 }
 
 // Assignment represents a set assignment in Update, such as
@@ -425,13 +176,23 @@ type Assignment struct {
 	Expr Expression
 }
 
+// VarAssignment represents a variable assignment in Set, such as set global a = 1.
+type VarAssignment struct {
+	Name        string
+	Expr        Expression
+	IsDefault   bool
+	IsGlobal    bool
+	IsSystem    bool
+	ExtendValue *Constant
+}
+
 // splitNormalFormItems split CNF(conjunctive normal form) like "a and b and c", or DNF(disjunctive normal form) like "a or b or c"
 func splitNormalFormItems(onExpr Expression, funcName string) []Expression {
 	switch v := onExpr.(type) {
 	case *ScalarFunction:
 		if v.FuncName.L == funcName {
 			var ret []Expression
-			for _, arg := range v.Args {
+			for _, arg := range v.GetArgs() {
 				ret = append(ret, splitNormalFormItems(arg, funcName)...)
 			}
 			return ret
@@ -440,12 +201,137 @@ func splitNormalFormItems(onExpr Expression, funcName string) []Expression {
 	return []Expression{onExpr}
 }
 
-// CNF means conjunctive normal form, e.g. "a and b and c"
+// SplitCNFItems splits CNF items.
+// CNF means conjunctive normal form, e.g. "a and b and c".
 func SplitCNFItems(onExpr Expression) []Expression {
-	return splitNormalFormItems(onExpr, ast.AndAnd)
+	return splitNormalFormItems(onExpr, ast.LogicAnd)
 }
 
-// DNF means disjunctive normal form, e.g. "a or b or c"
+// SplitDNFItems splits DNF items.
+// DNF means disjunctive normal form, e.g. "a or b or c".
 func SplitDNFItems(onExpr Expression) []Expression {
-	return splitNormalFormItems(onExpr, ast.OrOr)
+	return splitNormalFormItems(onExpr, ast.LogicOr)
+}
+
+// EvaluateExprWithNull sets columns in schema as null and calculate the final result of the scalar function.
+// If the Expression is a non-constant value, it means the result is unknown.
+func EvaluateExprWithNull(ctx context.Context, schema *Schema, expr Expression) Expression {
+	switch x := expr.(type) {
+	case *ScalarFunction:
+		args := make([]Expression, len(x.GetArgs()))
+		for i, arg := range x.GetArgs() {
+			args[i] = EvaluateExprWithNull(ctx, schema, arg)
+		}
+		return NewFunctionInternal(ctx, x.FuncName.L, types.NewFieldType(mysql.TypeTiny), args...)
+	case *Column:
+		if !schema.Contains(x) {
+			return x
+		}
+		return &Constant{Value: types.Datum{}, RetType: types.NewFieldType(mysql.TypeNull)}
+	case *Constant:
+		if x.DeferredExpr != nil {
+			return FoldConstant(x)
+		}
+	}
+	return expr.Clone()
+}
+
+// TableInfo2Schema converts table info to schema with empty DBName.
+func TableInfo2Schema(tbl *model.TableInfo) *Schema {
+	return TableInfo2SchemaWithDBName(model.CIStr{}, tbl)
+}
+
+// TableInfo2SchemaWithDBName converts table info to schema.
+func TableInfo2SchemaWithDBName(dbName model.CIStr, tbl *model.TableInfo) *Schema {
+	cols := ColumnInfos2ColumnsWithDBName(dbName, tbl.Name, tbl.Columns)
+	keys := make([]KeyInfo, 0, len(tbl.Indices)+1)
+	for _, idx := range tbl.Indices {
+		if !idx.Unique || idx.State != model.StatePublic {
+			continue
+		}
+		ok := true
+		newKey := make([]*Column, 0, len(idx.Columns))
+		for _, idxCol := range idx.Columns {
+			find := false
+			for i, col := range tbl.Columns {
+				if idxCol.Name.L == col.Name.L {
+					if !mysql.HasNotNullFlag(col.Flag) {
+						break
+					}
+					newKey = append(newKey, cols[i])
+					find = true
+					break
+				}
+			}
+			if !find {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			keys = append(keys, newKey)
+		}
+	}
+	if tbl.PKIsHandle {
+		for i, col := range tbl.Columns {
+			if mysql.HasPriKeyFlag(col.Flag) {
+				keys = append(keys, KeyInfo{cols[i]})
+				break
+			}
+		}
+	}
+	schema := NewSchema(cols...)
+	schema.SetUniqueKeys(keys)
+	return schema
+}
+
+// ColumnInfos2ColumnsWithDBName converts a slice of ColumnInfo to a slice of Column.
+func ColumnInfos2ColumnsWithDBName(dbName, tblName model.CIStr, colInfos []*model.ColumnInfo) []*Column {
+	columns := make([]*Column, 0, len(colInfos))
+	for i, col := range colInfos {
+		newCol := &Column{
+			ColName:  col.Name,
+			TblName:  tblName,
+			DBName:   dbName,
+			RetType:  &col.FieldType,
+			Position: i,
+			Index:    col.Offset,
+		}
+		columns = append(columns, newCol)
+	}
+	return columns
+}
+
+// NewValuesFunc creates a new values function.
+func NewValuesFunc(offset int, retTp *types.FieldType, ctx context.Context) *ScalarFunction {
+	fc := &valuesFunctionClass{baseFunctionClass{ast.Values, 0, 0}, offset, retTp}
+	bt, err := fc.getFunction(ctx, nil)
+	terror.Log(errors.Trace(err))
+	return &ScalarFunction{
+		FuncName: model.NewCIStr(ast.Values),
+		RetType:  retTp,
+		Function: bt,
+	}
+}
+
+// IsHybridType checks whether a ClassString expression is a hybrid type value which will return different types of value in different context.
+//
+// For ENUM/SET which is consist of a string attribute `Name` and an int attribute `Value`,
+// it will cause an error if we convert ENUM/SET to int as a string value.
+//
+// For BinaryLiteral/MysqlBit, we will get a wrong result if we convert it to int as a string value.
+// For example, when convert `0b101` to int, the result should be 5, but we will get 101 if we regard it as a string.
+func IsHybridType(expr Expression) bool {
+	if expr.GetType().Hybrid() {
+		return true
+	}
+
+	// For a constant, the field type will be inferred as `VARCHAR` when the kind of it is BinaryLiteral
+	if con, ok := expr.(*Constant); ok {
+		switch con.Value.Kind() {
+		case types.KindBinaryLiteral:
+			return true
+		}
+	}
+	return false
 }

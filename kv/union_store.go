@@ -33,6 +33,8 @@ type UnionStore interface {
 	SetOption(opt Option, val interface{})
 	// DelOption deletes an option.
 	DelOption(opt Option)
+	// GetOption gets an option.
+	GetOption(opt Option) interface{}
 }
 
 // Option is used for customizing kv store's behaviors during a transaction.
@@ -99,7 +101,7 @@ type lazyMemBuffer struct {
 
 func (lmb *lazyMemBuffer) Get(k Key) ([]byte, error) {
 	if lmb.mb == nil {
-		return nil, ErrNotExist
+		return nil, errors.Trace(ErrNotExist)
 	}
 
 	return lmb.mb.Get(k)
@@ -133,6 +135,20 @@ func (lmb *lazyMemBuffer) SeekReverse(k Key) (Iterator, error) {
 		return invalidIterator{}, nil
 	}
 	return lmb.mb.SeekReverse(k)
+}
+
+func (lmb *lazyMemBuffer) Size() int {
+	if lmb.mb == nil {
+		return 0
+	}
+	return lmb.mb.Size()
+}
+
+func (lmb *lazyMemBuffer) Len() int {
+	if lmb.mb == nil {
+		return 0
+	}
+	return lmb.mb.Len()
 }
 
 // Get implements the Retriever interface.
@@ -207,6 +223,11 @@ func (us *unionStore) SetOption(opt Option, val interface{}) {
 // DelOption implements the UnionStore DelOption interface.
 func (us *unionStore) DelOption(opt Option) {
 	delete(us.opts, opt)
+}
+
+// GetOption implements the UnionStore GetOption interface.
+func (us *unionStore) GetOption(opt Option) interface{} {
+	return us.opts[opt]
 }
 
 type options map[Option]interface{}

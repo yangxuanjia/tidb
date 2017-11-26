@@ -14,6 +14,7 @@
 package terror
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -23,12 +24,18 @@ import (
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
 var _ = Suite(&testTErrorSuite{})
 
 type testTErrorSuite struct {
+}
+
+func (s *testTErrorSuite) TestErrCode(c *C) {
+	c.Assert(CodeMissConnectionID, Equals, ErrCode(1))
+	c.Assert(CodeResultUndetermined, Equals, ErrCode(2))
 }
 
 func (s *testTErrorSuite) TestTError(c *C) {
@@ -64,6 +71,27 @@ func (s *testTErrorSuite) TestTError(c *C) {
 	sqlErr := e.ToSQLError()
 	c.Assert(sqlErr.Message, Equals, "Duplicate entry '1' for key 'PRIMARY'")
 	c.Assert(sqlErr.Code, Equals, uint16(1062))
+
+	err := errors.Trace(ErrCritical.GenByArgs("test"))
+	c.Assert(ErrCritical.Equal(err), IsTrue)
+
+	err = errors.Trace(ErrCritical)
+	c.Assert(ErrCritical.Equal(err), IsTrue)
+}
+
+func (s *testTErrorSuite) TestJson(c *C) {
+	prevTErr := &Error{
+		class:   ClassTable,
+		code:    CodeExecResultIsEmpty,
+		message: "json test",
+	}
+	buf, err := json.Marshal(prevTErr)
+	c.Assert(err, IsNil)
+	var curTErr Error
+	err = json.Unmarshal(buf, &curTErr)
+	c.Assert(err, IsNil)
+	isEqual := prevTErr.Equal(&curTErr)
+	c.Assert(isEqual, IsTrue)
 }
 
 var predefinedErr = ClassExecutor.New(ErrCode(123), "predefiend error")

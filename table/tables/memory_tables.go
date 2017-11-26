@@ -16,8 +16,8 @@ package tables
 import (
 	"sync"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	"github.com/petar/GoLLRB/llrb"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/kv"
@@ -25,7 +25,7 @@ import (
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/tablecodec"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
 )
 
 type itemKey int64
@@ -73,11 +73,11 @@ type MemoryTable struct {
 }
 
 // MemoryTableFromMeta creates a Table instance from model.TableInfo.
-func MemoryTableFromMeta(alloc autoid.Allocator, tblInfo *model.TableInfo) (table.Table, error) {
+func MemoryTableFromMeta(alloc autoid.Allocator, tblInfo *model.TableInfo) table.Table {
 	columns := make([]*table.Column, 0, len(tblInfo.Columns))
 	var pkHandleColumn *table.Column
 	for _, colInfo := range tblInfo.Columns {
-		col := &table.Column{ColumnInfo: *colInfo}
+		col := table.ToColumn(colInfo)
 		columns = append(columns, col)
 		if col.IsPKHandleColumn(tblInfo) {
 			pkHandleColumn = col
@@ -86,7 +86,7 @@ func MemoryTableFromMeta(alloc autoid.Allocator, tblInfo *model.TableInfo) (tabl
 	t := newMemoryTable(tblInfo.ID, tblInfo.Name.O, columns, alloc)
 	t.pkHandleCol = pkHandleColumn
 	t.meta = tblInfo
-	return t, nil
+	return t
 }
 
 // newMemoryTable constructs a MemoryTable instance.
@@ -119,6 +119,16 @@ func (t *MemoryTable) Seek(ctx context.Context, handle int64) (int64, bool, erro
 
 // Indices implements table.Table Indices interface.
 func (t *MemoryTable) Indices() []table.Index {
+	return nil
+}
+
+// WritableIndices implements table.Table WritableIndices interface.
+func (t *MemoryTable) WritableIndices() []table.Index {
+	return nil
+}
+
+// DeletableIndices implements table.Table DeletableIndices interface.
+func (t *MemoryTable) DeletableIndices() []table.Index {
 	return nil
 }
 
@@ -157,14 +167,13 @@ func (t *MemoryTable) FirstKey() kv.Key {
 	return t.RecordKey(0)
 }
 
-// Truncate implements table.Table Truncate interface.
-func (t *MemoryTable) Truncate(ctx context.Context) error {
+// Truncate drops all data in Memory Table.
+func (t *MemoryTable) Truncate() {
 	t.tree = llrb.New()
-	return nil
 }
 
 // UpdateRecord implements table.Table UpdateRecord interface.
-func (t *MemoryTable) UpdateRecord(ctx context.Context, h int64, oldData []types.Datum, newData []types.Datum, touched map[int]bool) error {
+func (t *MemoryTable) UpdateRecord(ctx context.Context, h int64, oldData, newData []types.Datum, touched []bool) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	item := t.tree.Get(itemKey(h))
@@ -177,9 +186,9 @@ func (t *MemoryTable) UpdateRecord(ctx context.Context, h int64, oldData []types
 }
 
 // AddRecord implements table.Table AddRecord interface.
-func (t *MemoryTable) AddRecord(ctx context.Context, r []types.Datum) (recordID int64, err error) {
+func (t *MemoryTable) AddRecord(ctx context.Context, r []types.Datum, skipHandleCheck bool) (recordID int64, err error) {
 	if t.pkHandleCol != nil {
-		recordID, err = r[t.pkHandleCol.Offset].ToInt64()
+		recordID, err = r[t.pkHandleCol.Offset].ToInt64(ctx.GetSessionVars().StmtCtx)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -230,11 +239,6 @@ func (t *MemoryTable) Row(ctx context.Context, h int64) ([]types.Datum, error) {
 	return r, nil
 }
 
-// LockRow implements table.Table LockRow interface.
-func (t *MemoryTable) LockRow(ctx context.Context, h int64, forRead bool) error {
-	return nil
-}
-
 // RemoveRecord implements table.Table RemoveRecord interface.
 func (t *MemoryTable) RemoveRecord(ctx context.Context, h int64, r []types.Datum) error {
 	t.mu.Lock()
@@ -248,6 +252,11 @@ func (t *MemoryTable) AllocAutoID() (int64, error) {
 	return t.alloc.Alloc(t.ID)
 }
 
+// Allocator implements table.Table Allocator interface.
+func (t *MemoryTable) Allocator() autoid.Allocator {
+	return t.alloc
+}
+
 // RebaseAutoID implements table.Table RebaseAutoID interface.
 func (t *MemoryTable) RebaseAutoID(newBase int64, isSetStep bool) error {
 	return t.alloc.Rebase(t.ID, newBase, isSetStep)
@@ -257,4 +266,9 @@ func (t *MemoryTable) RebaseAutoID(newBase int64, isSetStep bool) error {
 func (t *MemoryTable) IterRecords(ctx context.Context, startKey kv.Key, cols []*table.Column,
 	fn table.RecordIterFunc) error {
 	return nil
+}
+
+// Type implements table.Table Type interface.
+func (t *MemoryTable) Type() table.Type {
+	return table.MemoryTable
 }

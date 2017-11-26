@@ -19,8 +19,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ngaut/log"
+	log "github.com/Sirupsen/logrus"
 	"github.com/pingcap/tidb/ast"
+	goctx "golang.org/x/net/context"
 )
 
 var smallCount = 100
@@ -31,7 +32,7 @@ func prepareBenchSession() Session {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.SetLevel(log.LOG_LEVEL_ERROR)
+	log.SetLevel(log.ErrorLevel)
 	se, err := CreateSession(store)
 	if err != nil {
 		log.Fatal(err)
@@ -86,9 +87,10 @@ func readResult(rs ast.RecordSet, count int) {
 }
 
 func BenchmarkBasic(b *testing.B) {
+	goCtx := goctx.Background()
 	se := prepareBenchSession()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select 1")
+		rs, err := se.Execute(goCtx, "select 1")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -97,12 +99,13 @@ func BenchmarkBasic(b *testing.B) {
 }
 
 func BenchmarkTableScan(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "int", "%v", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t")
+		rs, err := se.Execute(goCtx, "select * from t")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -110,13 +113,44 @@ func BenchmarkTableScan(b *testing.B) {
 	}
 }
 
+func BenchmarkExplainTableScan(b *testing.B) {
+	goCtx := goctx.Background()
+	b.StopTimer()
+	se := prepareBenchSession()
+	prepareBenchData(se, "int", "%v", 0)
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := se.Execute(goCtx, "explain select * from t")
+		if err != nil {
+			b.Fatal(err)
+		}
+		readResult(rs[0], 1)
+	}
+}
+
 func BenchmarkTableLookup(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "int", "%d", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t where pk = 64")
+		rs, err := se.Execute(goCtx, "select * from t where pk = 64")
+		if err != nil {
+			b.Fatal(err)
+		}
+		readResult(rs[0], 1)
+	}
+}
+
+func BenchmarkExplainTableLookup(b *testing.B) {
+	goCtx := goctx.Background()
+	b.StopTimer()
+	se := prepareBenchSession()
+	prepareBenchData(se, "int", "%d", 0)
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := se.Execute(goCtx, "explain select * from t where pk = 64")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -125,12 +159,13 @@ func BenchmarkTableLookup(b *testing.B) {
 }
 
 func BenchmarkStringIndexScan(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "varchar(255)", "'hello %d'", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t where col > 'hello'")
+		rs, err := se.Execute(goCtx, "select * from t where col > 'hello'")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -138,13 +173,29 @@ func BenchmarkStringIndexScan(b *testing.B) {
 	}
 }
 
+func BenchmarkExplainStringIndexScan(b *testing.B) {
+	goCtx := goctx.Background()
+	b.StopTimer()
+	se := prepareBenchSession()
+	prepareBenchData(se, "varchar(255)", "'hello %d'", 0)
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		rs, err := se.Execute(goCtx, "explain select * from t where col > 'hello'")
+		if err != nil {
+			b.Fatal(err)
+		}
+		readResult(rs[0], 1)
+	}
+}
+
 func BenchmarkStringIndexLookup(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "varchar(255)", "'hello %d'", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t where col = 'hello 64'")
+		rs, err := se.Execute(goCtx, "select * from t where col = 'hello 64'")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -153,12 +204,13 @@ func BenchmarkStringIndexLookup(b *testing.B) {
 }
 
 func BenchmarkIntegerIndexScan(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "int", "%v", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t where col >= 0")
+		rs, err := se.Execute(goCtx, "select * from t where col >= 0")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -167,12 +219,13 @@ func BenchmarkIntegerIndexScan(b *testing.B) {
 }
 
 func BenchmarkIntegerIndexLookup(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "int", "%v", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t where col = 64")
+		rs, err := se.Execute(goCtx, "select * from t where col = 64")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -181,12 +234,13 @@ func BenchmarkIntegerIndexLookup(b *testing.B) {
 }
 
 func BenchmarkDecimalIndexScan(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "decimal(32,6)", "%v.1234", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t where col >= 0")
+		rs, err := se.Execute(goCtx, "select * from t where col >= 0")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -195,12 +249,13 @@ func BenchmarkDecimalIndexScan(b *testing.B) {
 }
 
 func BenchmarkDecimalIndexLookup(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareBenchData(se, "decimal(32,6)", "%v.1234", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t where col = 64.1234")
+		rs, err := se.Execute(goCtx, "select * from t where col = 64.1234")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -231,12 +286,13 @@ func BenchmarkInsertNoIndex(b *testing.B) {
 }
 
 func BenchmarkSort(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareSortBenchData(se, "int", "%v", bigCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t order by col limit 50")
+		rs, err := se.Execute(goCtx, "select * from t order by col limit 50")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -245,12 +301,13 @@ func BenchmarkSort(b *testing.B) {
 }
 
 func BenchmarkJoin(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareJoinBenchData(se, "int", "%v", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t a join t b on a.col = b.col")
+		rs, err := se.Execute(goCtx, "select * from t a join t b on a.col = b.col")
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -259,12 +316,13 @@ func BenchmarkJoin(b *testing.B) {
 }
 
 func BenchmarkJoinLimit(b *testing.B) {
+	goCtx := goctx.Background()
 	b.StopTimer()
 	se := prepareBenchSession()
 	prepareJoinBenchData(se, "int", "%v", smallCount)
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		rs, err := se.Execute("select * from t a join t b on a.col = b.col limit 1")
+		rs, err := se.Execute(goCtx, "select * from t a join t b on a.col = b.col limit 1")
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -15,10 +15,13 @@ package tikv
 
 import (
 	"fmt"
+	"time"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tipb/go-binlog"
+	goctx "golang.org/x/net/context"
 )
 
 var (
@@ -27,42 +30,63 @@ var (
 
 // tikvTxn implements kv.Transaction.
 type tikvTxn struct {
-	us       kv.UnionStore
-	store    *tikvStore // for connection to region.
-	startTS  uint64
-	commitTS uint64
-	valid    bool
-	lockKeys [][]byte
-	dirty    bool
+	snapshot  *tikvSnapshot
+	us        kv.UnionStore
+	store     *tikvStore // for connection to region.
+	startTS   uint64
+	startTime time.Time // Monotonic timestamp for recording txn time consuming.
+	commitTS  uint64
+	valid     bool
+	lockKeys  [][]byte
+	dirty     bool
+	setCnt    int64
 }
 
 func newTiKVTxn(store *tikvStore) (*tikvTxn, error) {
-	bo := NewBackoffer(tsoMaxBackoff)
+	bo := NewBackoffer(tsoMaxBackoff, goctx.Background())
 	startTS, err := store.getTimestampWithRetry(bo)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	return newTikvTxnWithStartTS(store, startTS)
+}
+
+// newTikvTxnWithStartTS creates a txn with startTS.
+func newTikvTxnWithStartTS(store *tikvStore, startTS uint64) (*tikvTxn, error) {
 	ver := kv.NewVersion(startTS)
+	snapshot := newTiKVSnapshot(store, ver)
 	return &tikvTxn{
-		us:      kv.NewUnionStore(newTiKVSnapshot(store, ver)),
-		store:   store,
-		startTS: startTS,
-		valid:   true,
+		snapshot:  snapshot,
+		us:        kv.NewUnionStore(snapshot),
+		store:     store,
+		startTS:   startTS,
+		startTime: time.Now(),
+		valid:     true,
 	}, nil
 }
 
 // Implement transaction interface.
 func (txn *tikvTxn) Get(k kv.Key) ([]byte, error) {
-	log.Debugf("Get key[%q] txn[%d]", k, txn.StartTS())
+	txnCmdCounter.WithLabelValues("get").Inc()
+	start := time.Now()
+	defer func() { txnCmdHistogram.WithLabelValues("get").Observe(time.Since(start).Seconds()) }()
+
 	ret, err := txn.us.Get(k)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+
+	err = txn.store.CheckVisibility(txn.startTS)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
 	return ret, nil
 }
 
 func (txn *tikvTxn) Set(k kv.Key, v []byte) error {
-	log.Debugf("Set key[%q] txn[%d]", k, txn.StartTS())
+	txn.setCnt++
+
 	txn.dirty = true
 	return txn.us.Set(k, v)
 }
@@ -72,60 +96,84 @@ func (txn *tikvTxn) String() string {
 }
 
 func (txn *tikvTxn) Seek(k kv.Key) (kv.Iterator, error) {
-	log.Debugf("Seek key[%q] txn[%d]", k, txn.StartTS())
+	txnCmdCounter.WithLabelValues("seek").Inc()
+	start := time.Now()
+	defer func() { txnCmdHistogram.WithLabelValues("seek").Observe(time.Since(start).Seconds()) }()
+
 	return txn.us.Seek(k)
 }
 
 // SeekReverse creates a reversed Iterator positioned on the first entry which key is less than k.
 func (txn *tikvTxn) SeekReverse(k kv.Key) (kv.Iterator, error) {
-	log.Debugf("SeekReverse key[%q] txn[%d]", k, txn.StartTS())
+	txnCmdCounter.WithLabelValues("seek_reverse").Inc()
+	start := time.Now()
+	defer func() { txnCmdHistogram.WithLabelValues("seek_reverse").Observe(time.Since(start).Seconds()) }()
+
 	return txn.us.SeekReverse(k)
 }
 
 func (txn *tikvTxn) Delete(k kv.Key) error {
-	log.Debugf("Delete key[%q] txn[%d]", k, txn.StartTS())
+	txnCmdCounter.WithLabelValues("delete").Inc()
+
 	txn.dirty = true
 	return txn.us.Delete(k)
 }
 
 func (txn *tikvTxn) SetOption(opt kv.Option, val interface{}) {
 	txn.us.SetOption(opt, val)
+	switch opt {
+	case kv.IsolationLevel:
+		txn.snapshot.isolationLevel = val.(kv.IsoLevel)
+	case kv.Priority:
+		txn.snapshot.priority = kvPriorityToCommandPri(val.(int))
+	case kv.NotFillCache:
+		txn.snapshot.notFillCache = val.(bool)
+	case kv.SyncLog:
+		txn.snapshot.syncLog = val.(bool)
+	}
 }
 
 func (txn *tikvTxn) DelOption(opt kv.Option) {
 	txn.us.DelOption(opt)
+	if opt == kv.IsolationLevel {
+		txn.snapshot.isolationLevel = kv.SI
+	}
 }
 
-func (txn *tikvTxn) Commit() error {
+func (txn *tikvTxn) Commit(ctx goctx.Context) error {
 	if !txn.valid {
 		return kv.ErrInvalidTxn
 	}
 	defer txn.close()
 
-	log.Debugf("[kv] start to commit txn %d", txn.StartTS())
+	txnCmdCounter.WithLabelValues("set").Add(float64(txn.setCnt))
+	txnCmdCounter.WithLabelValues("commit").Inc()
+	start := time.Now()
+	defer func() { txnCmdHistogram.WithLabelValues("commit").Observe(time.Since(start).Seconds()) }()
+
 	if err := txn.us.CheckLazyConditionPairs(); err != nil {
 		return errors.Trace(err)
 	}
 
-	committer, err := newTxnCommitter(txn)
+	committer, err := newTwoPhaseCommitter(txn)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	if committer == nil {
 		return nil
 	}
-	err = committer.Commit()
+	err = committer.execute(ctx)
 	if err != nil {
+		committer.writeFinishBinlog(binlog.BinlogType_Rollback, 0)
 		return errors.Trace(err)
 	}
+	committer.writeFinishBinlog(binlog.BinlogType_Commit, int64(committer.commitTS))
 	txn.commitTS = committer.commitTS
-	log.Debugf("[kv] finish commit txn %d", txn.StartTS())
 	return nil
 }
 
-func (txn *tikvTxn) close() error {
+func (txn *tikvTxn) close() {
 	txn.valid = false
-	return nil
 }
 
 func (txn *tikvTxn) Rollback() error {
@@ -133,21 +181,18 @@ func (txn *tikvTxn) Rollback() error {
 		return kv.ErrInvalidTxn
 	}
 	txn.close()
-	log.Warnf("[kv] Rollback txn %d", txn.StartTS())
+	log.Infof("[kv] Rollback txn %d", txn.StartTS())
+	txnCmdCounter.WithLabelValues("rollback").Inc()
+
 	return nil
 }
 
 func (txn *tikvTxn) LockKeys(keys ...kv.Key) error {
+	txnCmdCounter.WithLabelValues("lock_keys").Inc()
 	for _, key := range keys {
 		txn.lockKeys = append(txn.lockKeys, key)
 	}
 	return nil
-}
-
-func (txn *tikvTxn) GetClient() kv.Client {
-	return &CopClient{
-		store: txn.store,
-	}
 }
 
 func (txn *tikvTxn) IsReadOnly() bool {
@@ -156,4 +201,16 @@ func (txn *tikvTxn) IsReadOnly() bool {
 
 func (txn *tikvTxn) StartTS() uint64 {
 	return txn.startTS
+}
+
+func (txn *tikvTxn) Valid() bool {
+	return txn.valid
+}
+
+func (txn *tikvTxn) Len() int {
+	return txn.us.Len()
+}
+
+func (txn *tikvTxn) Size() int {
+	return txn.us.Size()
 }

@@ -15,16 +15,18 @@ package meta_test
 
 import (
 	"testing"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/util/testleak"
+	goctx "golang.org/x/net/context"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -35,8 +37,7 @@ type testSuite struct {
 
 func (s *testSuite) TestMeta(c *C) {
 	defer testleak.AfterTest(c)()
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
+	store, err := tikv.NewMockTikvStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
 
@@ -100,7 +101,7 @@ func (s *testSuite) TestMeta(c *C) {
 	err = t.CreateTable(1, tbInfo)
 	c.Assert(err, IsNil)
 
-	n, err = t.GenAutoTableID(1, 1, 10)
+	n, err = t.GenAutoTableID(1, 1, 1, 10)
 	c.Assert(err, IsNil)
 	c.Assert(n, Equals, int64(10))
 
@@ -133,40 +134,153 @@ func (s *testSuite) TestMeta(c *C) {
 	tables, err := t.ListTables(1)
 	c.Assert(err, IsNil)
 	c.Assert(tables, DeepEquals, []*model.TableInfo{tbInfo, tbInfo2})
-
-	err = t.DropTable(1, 2)
+	// Generate an auto id.
+	n, err = t.GenAutoTableID(1, 1, 2, 10)
 	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(10))
+	// Make sure the auto id key-value entry is there.
+	n, err = t.GetAutoTableID(1, 2)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(10))
+
+	err = t.DropTable(1, tbInfo2, true)
+	c.Assert(err, IsNil)
+	tbInfo2.OldSchemaID = 1
+	// Make sure auto id key-value entry is gone.
+	n, err = t.GetAutoTableID(1, 2)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(0))
 
 	tables, err = t.ListTables(1)
 	c.Assert(err, IsNil)
 	c.Assert(tables, DeepEquals, []*model.TableInfo{tbInfo})
 
+	// Test case for drop a table without delete auto id key-value entry.
+	tid := int64(100)
+	tbInfo100 := &model.TableInfo{
+		ID:   tid,
+		Name: model.NewCIStr("t_rename"),
+	}
+	// Create table.
+	err = t.CreateTable(1, tbInfo100)
+	c.Assert(err, IsNil)
+	// Update auto ID.
+	originalDBID := int64(1)
+	currentDBID := int64(1)
+	n, err = t.GenAutoTableID(originalDBID, currentDBID, tid, 10)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(10))
+	// Fail to update auto ID.
+	// The table ID doesn't exist.
+	nonExistentID := int64(1234)
+	_, err = t.GenAutoTableID(originalDBID, currentDBID, nonExistentID, 10)
+	c.Assert(err, NotNil)
+	// Fail to update auto ID.
+	// The current database ID doesn't exist.
+	currentDBID = nonExistentID
+	_, err = t.GenAutoTableID(originalDBID, currentDBID, tid, 10)
+	c.Assert(err, NotNil)
+	// Make sure that auto id key-value entry is still 10.
+	n, err = t.GetAutoTableID(originalDBID, tid)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(10))
+	// Succeed in generating auto ID.
+	// Drop the table from original DB, then create the current DB and create the tbInfo100 under the current DB.
+	tbInfo100.OldSchemaID = currentDBID
+	// Drop table without touch auto id key-value entry.
+	err = t.DropTable(originalDBID, tbInfo100, false)
+	c.Assert(err, IsNil)
+	dbInfo1234 := &model.DBInfo{
+		ID:   currentDBID,
+		Name: model.NewCIStr("db_x"),
+	}
+	err = t.CreateDatabase(dbInfo1234)
+	c.Assert(err, IsNil)
+	err = t.CreateTable(currentDBID, tbInfo100)
+	c.Assert(err, IsNil)
+	_, err = t.GenAutoTableID(originalDBID, currentDBID, tid, 10)
+	c.Assert(err, IsNil)
+	n, err = t.GetAutoTableID(originalDBID, tid)
+	c.Assert(err, IsNil)
+	c.Assert(n, Equals, int64(20))
+
 	err = t.DropDatabase(1)
+	c.Assert(err, IsNil)
+	err = t.DropDatabase(currentDBID)
 	c.Assert(err, IsNil)
 
 	dbs, err = t.ListDatabases()
 	c.Assert(err, IsNil)
 	c.Assert(dbs, HasLen, 0)
 
-	bootstrapped, err := t.IsBootstrapped()
+	bootstrapVer, err := t.GetBootstrapVersion()
 	c.Assert(err, IsNil)
-	c.Assert(bootstrapped, IsFalse)
+	c.Assert(bootstrapVer, Equals, int64(0))
 
-	err = t.FinishBootstrap()
+	err = t.FinishBootstrap(int64(1))
 	c.Assert(err, IsNil)
 
-	bootstrapped, err = t.IsBootstrapped()
+	bootstrapVer, err = t.GetBootstrapVersion()
 	c.Assert(err, IsNil)
-	c.Assert(bootstrapped, IsTrue)
+	c.Assert(bootstrapVer, Equals, int64(1))
 
-	err = txn.Commit()
+	// Test case for meta.FinishBootstrap with a version.
+	err = t.FinishBootstrap(int64(10))
 	c.Assert(err, IsNil)
+	bootstrapVer, err = t.GetBootstrapVersion()
+	c.Assert(err, IsNil)
+	c.Assert(bootstrapVer, Equals, int64(10))
+
+	// Test case for SchemaDiff.
+	schemaDiff := &model.SchemaDiff{
+		Version:    100,
+		SchemaID:   1,
+		Type:       model.ActionTruncateTable,
+		TableID:    2,
+		OldTableID: 3,
+	}
+	err = t.SetSchemaDiff(schemaDiff)
+	c.Assert(err, IsNil)
+	readDiff, err := t.GetSchemaDiff(schemaDiff.Version)
+	c.Assert(readDiff, DeepEquals, schemaDiff)
+
+	err = txn.Commit(goctx.Background())
+	c.Assert(err, IsNil)
+}
+
+func (s *testSuite) TestSnapshot(c *C) {
+	defer testleak.AfterTest(c)()
+	store, err := tikv.NewMockTikvStore()
+	c.Assert(err, IsNil)
+	defer store.Close()
+
+	txn, _ := store.Begin()
+	m := meta.NewMeta(txn)
+	m.GenGlobalID()
+	n, _ := m.GetGlobalID()
+	c.Assert(n, Equals, int64(1))
+	txn.Commit(goctx.Background())
+
+	ver1, _ := store.CurrentVersion()
+	time.Sleep(time.Millisecond)
+	txn, _ = store.Begin()
+	m = meta.NewMeta(txn)
+	m.GenGlobalID()
+	n, _ = m.GetGlobalID()
+	c.Assert(n, Equals, int64(2))
+	txn.Commit(goctx.Background())
+
+	snapshot, _ := store.GetSnapshot(ver1)
+	snapMeta := meta.NewSnapshotMeta(snapshot)
+	n, _ = snapMeta.GetGlobalID()
+	c.Assert(n, Equals, int64(1))
+	_, err = snapMeta.GenGlobalID()
+	c.Assert(err, NotNil)
 }
 
 func (s *testSuite) TestDDL(c *C) {
 	defer testleak.AfterTest(c)()
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
+	store, err := tikv.NewMockTikvStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
 
@@ -176,13 +290,6 @@ func (s *testSuite) TestDDL(c *C) {
 	defer txn.Rollback()
 
 	t := meta.NewMeta(txn)
-
-	owner := &model.Owner{OwnerID: "1"}
-	err = t.SetDDLJobOwner(owner)
-	c.Assert(err, IsNil)
-	ov, err := t.GetDDLJobOwner()
-	c.Assert(err, IsNil)
-	c.Assert(owner, DeepEquals, ov)
 
 	job := &model.Job{ID: 1}
 	err = t.EnQueueDDLJob(job)
@@ -221,40 +328,14 @@ func (s *testSuite) TestDDL(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(v, DeepEquals, job)
 
-	// DDL background job test
-	err = t.SetBgJobOwner(owner)
+	all, err := t.GetAllHistoryDDLJobs()
 	c.Assert(err, IsNil)
-	ov, err = t.GetBgJobOwner()
-	c.Assert(err, IsNil)
-	c.Assert(owner, DeepEquals, ov)
+	var lastID int64
+	for _, job := range all {
+		c.Assert(job.ID, Greater, lastID)
+		lastID = job.ID
+	}
 
-	bgJob := &model.Job{ID: 1}
-	err = t.EnQueueBgJob(bgJob)
-	c.Assert(err, IsNil)
-	n, err = t.BgJobQueueLen()
-	c.Assert(err, IsNil)
-	c.Assert(n, Equals, int64(1))
-
-	v, err = t.GetBgJob(0)
-	c.Assert(err, IsNil)
-	c.Assert(v, DeepEquals, bgJob)
-	v, err = t.GetBgJob(1)
-	c.Assert(err, IsNil)
-	c.Assert(v, IsNil)
-	bgJob.ID = 2
-	err = t.UpdateBgJob(0, bgJob)
-	c.Assert(err, IsNil)
-
-	v, err = t.DeQueueBgJob()
-	c.Assert(err, IsNil)
-	c.Assert(v, DeepEquals, bgJob)
-
-	err = t.AddHistoryBgJob(bgJob)
-	c.Assert(err, IsNil)
-	v, err = t.GetHistoryBgJob(2)
-	c.Assert(err, IsNil)
-	c.Assert(v, DeepEquals, bgJob)
-
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 }

@@ -17,18 +17,17 @@ import (
 	"sort"
 
 	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
 )
 
 // dirtyDB stores uncommitted write operations for a transaction.
 // It is stored and retrieved by context.Value and context.SetValue method.
 type dirtyDB struct {
-	// Key is tableID.
+	// tables is a map whose key is tableID.
 	tables map[int64]*dirtyTable
 }
 
@@ -50,7 +49,7 @@ func (udb *dirtyDB) deleteRow(tid int64, handle int64) {
 
 func (udb *dirtyDB) truncateTable(tid int64) {
 	dt := udb.getDirtyTable(tid)
-	dt.addedRows = make(map[int64][]types.Datum)
+	dt.addedRows = make(map[int64]Row)
 	dt.truncated = true
 }
 
@@ -58,7 +57,7 @@ func (udb *dirtyDB) getDirtyTable(tid int64) *dirtyTable {
 	dt, ok := udb.tables[tid]
 	if !ok {
 		dt = &dirtyTable{
-			addedRows:   make(map[int64][]types.Datum),
+			addedRows:   make(map[int64]Row),
 			deletedRows: make(map[int64]struct{}),
 		}
 		udb.tables[tid] = dt
@@ -67,27 +66,19 @@ func (udb *dirtyDB) getDirtyTable(tid int64) *dirtyTable {
 }
 
 type dirtyTable struct {
-	// key is handle.
-	addedRows   map[int64][]types.Datum
+	// addedRows ...
+	// the key is handle.
+	addedRows   map[int64]Row
 	deletedRows map[int64]struct{}
 	truncated   bool
 }
 
-type dirtyDBKeyType int
-
-func (u dirtyDBKeyType) String() string {
-	return "dirtyDBKeyType"
-}
-
-// DirtyDBKey is the key to *dirtyDB for a context.
-const DirtyDBKey dirtyDBKeyType = 1
-
 func getDirtyDB(ctx context.Context) *dirtyDB {
 	var udb *dirtyDB
-	x := ctx.Value(DirtyDBKey)
+	x := ctx.GetSessionVars().TxnCtx.DirtyDB
 	if x == nil {
 		udb = &dirtyDB{tables: make(map[int64]*dirtyTable)}
-		ctx.SetValue(DirtyDBKey, udb)
+		ctx.GetSessionVars().TxnCtx.DirtyDB = udb
 	} else {
 		udb = x.(*dirtyDB)
 	}
@@ -96,40 +87,33 @@ func getDirtyDB(ctx context.Context) *dirtyDB {
 
 // UnionScanExec merges the rows from dirty table and the rows from XAPI request.
 type UnionScanExec struct {
-	ctx   context.Context
-	Src   Executor
-	dirty *dirtyTable
-	// srcUsedIndex is the column offsets of the index which Src executor has used.
-	usedIndex    []int
-	desc         bool
-	condition    ast.ExprNode
-	newCondition expression.Expression
+	baseExecutor
 
-	addedRows   []*Row
+	dirty *dirtyTable
+	// usedIndex is the column offsets of the index which Src executor has used.
+	usedIndex  []int
+	desc       bool
+	conditions []expression.Expression
+	columns    []*model.ColumnInfo
+
+	// belowHandleIndex is the handle's position of the below scan plan.
+	belowHandleIndex int
+
+	addedRows   []Row
 	cursor      int
 	sortErr     error
-	snapshotRow *Row
-}
-
-// Schema implements Executor Schema interface.
-func (us *UnionScanExec) Schema() expression.Schema {
-	return us.Src.Schema()
-}
-
-// Fields implements Executor Fields interface.
-func (us *UnionScanExec) Fields() []*ast.ResultField {
-	return us.Src.Fields()
+	snapshotRow Row
 }
 
 // Next implements Execution Next interface.
-func (us *UnionScanExec) Next() (*Row, error) {
+func (us *UnionScanExec) Next() (Row, error) {
 	for {
 		snapshotRow, err := us.getSnapshotRow()
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 		addedRow := us.getAddedRow()
-		var row *Row
+		var row Row
 		if addedRow == nil {
 			row = snapshotRow
 		} else if snapshotRow == nil {
@@ -143,36 +127,51 @@ func (us *UnionScanExec) Next() (*Row, error) {
 		if row == nil {
 			return nil, nil
 		}
-		if row == snapshotRow {
+		cmp, err := us.twoRowsAreEqual(row, snapshotRow)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if cmp {
 			us.snapshotRow = nil
 		} else {
 			us.cursor++
-		}
-		for i, field := range us.Src.Fields() {
-			field.Expr.SetDatum(row.Data[i])
 		}
 		return row, nil
 	}
 }
 
-func (us *UnionScanExec) getSnapshotRow() (*Row, error) {
+func (us *UnionScanExec) twoRowsAreEqual(a, b Row) (bool, error) {
+	if len(a) != len(b) {
+		return false, nil
+	}
+	sc := us.ctx.GetSessionVars().StmtCtx
+	for i := 0; i < len(a); i++ {
+		cmp, err := a[i].CompareDatum(sc, &b[i])
+		if err != nil {
+			return false, errors.Trace(err)
+		}
+		if cmp != 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (us *UnionScanExec) getSnapshotRow() (Row, error) {
 	if us.dirty.truncated {
 		return nil, nil
 	}
 	var err error
 	if us.snapshotRow == nil {
 		for {
-			us.snapshotRow, err = us.Src.Next()
+			us.snapshotRow, err = us.children[0].Next()
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
 			if us.snapshotRow == nil {
 				break
 			}
-			if len(us.snapshotRow.RowKeys) != 1 {
-				return nil, ErrRowKeyCount
-			}
-			snapshotHandle := us.snapshotRow.RowKeys[0].Handle
+			snapshotHandle := us.snapshotRow[us.belowHandleIndex].GetInt64()
 			if _, ok := us.dirty.deletedRows[snapshotHandle]; ok {
 				continue
 			}
@@ -187,20 +186,20 @@ func (us *UnionScanExec) getSnapshotRow() (*Row, error) {
 	return us.snapshotRow, nil
 }
 
-func (us *UnionScanExec) getAddedRow() *Row {
-	var addedRow *Row
+func (us *UnionScanExec) getAddedRow() Row {
+	var addedRow Row
 	if us.cursor < len(us.addedRows) {
 		addedRow = us.addedRows[us.cursor]
 	}
 	return addedRow
 }
 
-func (us *UnionScanExec) pickRow(a, b *Row) (*Row, error) {
+func (us *UnionScanExec) pickRow(a, b Row) (Row, error) {
 	addedCmpSrc, err := us.compare(a, b)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	var row *Row
+	var row Row
 	// Compare result will never be 0.
 	if us.desc {
 		if addedCmpSrc < 0 {
@@ -218,16 +217,12 @@ func (us *UnionScanExec) pickRow(a, b *Row) (*Row, error) {
 	return row, nil
 }
 
-// Close implements Executor Close interface.
-func (us *UnionScanExec) Close() error {
-	return us.Src.Close()
-}
-
-func (us *UnionScanExec) compare(a, b *Row) (int, error) {
+func (us *UnionScanExec) compare(a, b Row) (int, error) {
+	sc := us.ctx.GetSessionVars().StmtCtx
 	for _, colOff := range us.usedIndex {
-		aColumn := a.Data[colOff]
-		bColumn := b.Data[colOff]
-		cmp, err := aColumn.CompareDatum(bColumn)
+		aColumn := a[colOff]
+		bColumn := b[colOff]
+		cmp, err := aColumn.CompareDatum(sc, &bColumn)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -235,8 +230,8 @@ func (us *UnionScanExec) compare(a, b *Row) (int, error) {
 			return cmp, nil
 		}
 	}
-	aHandle := a.RowKeys[0].Handle
-	bHandle := b.RowKeys[0].Handle
+	aHandle := a[us.belowHandleIndex].GetInt64()
+	bHandle := b[us.belowHandleIndex].GetInt64()
 	var cmp int
 	if aHandle == bHandle {
 		cmp = 0
@@ -248,35 +243,26 @@ func (us *UnionScanExec) compare(a, b *Row) (int, error) {
 	return cmp, nil
 }
 
-func (us *UnionScanExec) buildAndSortAddedRows(t table.Table, asName *model.CIStr) error {
-	us.addedRows = make([]*Row, 0, len(us.dirty.addedRows))
+func (us *UnionScanExec) buildAndSortAddedRows(t table.Table) error {
+	us.addedRows = make([]Row, 0, len(us.dirty.addedRows))
 	for h, data := range us.dirty.addedRows {
-		var newData []types.Datum
-		if len(us.Src.Schema()) == len(data) {
-			newData = data
-		} else {
-			newData = make([]types.Datum, 0, len(us.Src.Schema()))
-			var columns []*model.ColumnInfo
-			if t, ok := us.Src.(*XSelectTableExec); ok {
-				columns = t.Columns
+		newData := make(types.DatumRow, 0, us.schema.Len())
+		for _, col := range us.columns {
+			if col.ID == model.ExtraHandleID {
+				newData = append(newData, types.NewIntDatum(h))
 			} else {
-				columns = us.Src.(*XSelectIndexExec).indexPlan.Columns
-			}
-			for _, col := range columns {
 				newData = append(newData, data[col.Offset])
 			}
 		}
-		if us.newCondition != nil {
-			matched, err := expression.EvalBool(us.newCondition, newData, us.ctx)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			if !matched {
-				continue
-			}
+		matched, err := expression.EvalBool(us.conditions, newData, us.ctx)
+		if err != nil {
+			return errors.Trace(err)
 		}
-		rowKeyEntry := &RowKeyEntry{Handle: h, Tbl: t, TableAsName: asName}
-		row := &Row{Data: newData, RowKeys: []*RowKeyEntry{rowKeyEntry}}
+		if !matched {
+			continue
+		}
+
+		row := newData
 		us.addedRows = append(us.addedRows, row)
 	}
 	if us.desc {

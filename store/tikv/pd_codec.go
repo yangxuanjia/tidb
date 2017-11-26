@@ -18,6 +18,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/pd/pd-client"
 	"github.com/pingcap/tidb/util/codec"
+	"golang.org/x/net/context"
 )
 
 type codecPDClient struct {
@@ -26,28 +27,36 @@ type codecPDClient struct {
 
 // GetRegion encodes the key before send requests to pd-server and decodes the
 // returned StartKey && EndKey from pd-server.
-func (c *codecPDClient) GetRegion(key []byte) (*metapb.Region, *metapb.Peer, error) {
+func (c *codecPDClient) GetRegion(ctx context.Context, key []byte) (*metapb.Region, *metapb.Peer, error) {
 	encodedKey := codec.EncodeBytes([]byte(nil), key)
-	region, peer, err := c.Client.GetRegion(encodedKey)
+	region, peer, err := c.Client.GetRegion(ctx, encodedKey)
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}
 	if region == nil {
 		return nil, nil, nil
 	}
-	if len(region.StartKey) != 0 {
-		_, decoded, err := codec.DecodeBytes(region.StartKey)
-		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
-		region.StartKey = decoded
-	}
-	if len(region.EndKey) != 0 {
-		_, decoded, err := codec.DecodeBytes(region.EndKey)
-		if err != nil {
-			return nil, nil, errors.Trace(err)
-		}
-		region.EndKey = decoded
+	err = decodeRegionMetaKey(region)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
 	}
 	return region, peer, nil
+}
+
+func decodeRegionMetaKey(r *metapb.Region) error {
+	if len(r.StartKey) != 0 {
+		_, decoded, err := codec.DecodeBytes(r.StartKey)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		r.StartKey = decoded
+	}
+	if len(r.EndKey) != 0 {
+		_, decoded, err := codec.DecodeBytes(r.EndKey)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		r.EndKey = decoded
+	}
+	return nil
 }

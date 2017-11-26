@@ -19,21 +19,22 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb"
 	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/tidb/sessionctx/binloginfo"
+	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
+	goctx "golang.org/x/net/context"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -45,19 +46,21 @@ type testSuite struct {
 }
 
 func (ts *testSuite) SetUpSuite(c *C) {
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
+	store, err := tikv.NewMockTikvStore()
 	c.Check(err, IsNil)
 	ts.store = store
+	_, err = tidb.BootstrapSession(store)
+	c.Assert(err, IsNil)
 	ts.se, err = tidb.CreateSession(ts.store)
 	c.Assert(err, IsNil)
 }
 
 func (ts *testSuite) TestBasic(c *C) {
-	_, err := ts.se.Execute("CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
+	_, err := ts.se.Execute(goctx.Background(), "CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
-	dom := sessionctx.GetDomain(ctx)
+	c.Assert(ctx.NewTxn(), IsNil)
+	dom := domain.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	c.Assert(tb.Meta().ID, Greater, int64(0))
@@ -73,7 +76,9 @@ func (ts *testSuite) TestBasic(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(autoid, Greater, int64(0))
 
-	rid, err := tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
+	ctx.GetSessionVars().BinlogClient = binloginfo.GetPumpClient()
+	ctx.GetSessionVars().InRestrictedSQL = false
+	rid, err := tb.AddRecord(ctx, types.MakeDatums(1, "abc"), false)
 	c.Assert(err, IsNil)
 	c.Assert(rid, Greater, int64(0))
 	row, err := tb.Row(ctx, rid)
@@ -81,12 +86,12 @@ func (ts *testSuite) TestBasic(c *C) {
 	c.Assert(len(row), Equals, 2)
 	c.Assert(row[0].GetInt64(), Equals, int64(1))
 
-	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "aba"))
+	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "aba"), false)
 	c.Assert(err, NotNil)
-	_, err = tb.AddRecord(ctx, types.MakeDatums(2, "abc"))
+	_, err = tb.AddRecord(ctx, types.MakeDatums(2, "abc"), false)
 	c.Assert(err, NotNil)
 
-	c.Assert(tb.UpdateRecord(ctx, rid, types.MakeDatums(1, "abc"), types.MakeDatums(1, "cba"), map[int]bool{0: false, 1: true}), IsNil)
+	c.Assert(tb.UpdateRecord(ctx, rid, types.MakeDatums(1, "abc"), types.MakeDatums(1, "cba"), []bool{false, true}), IsNil)
 
 	tb.IterRecords(ctx, tb.FirstKey(), tb.Cols(), func(h int64, data []types.Datum, cols []*table.Column) (bool, error) {
 		return true, nil
@@ -114,24 +119,27 @@ func (ts *testSuite) TestBasic(c *C) {
 	c.Assert(tb.RemoveRecord(ctx, rid, types.MakeDatums(1, "cba")), IsNil)
 	// Make sure index data is also removed after tb.RemoveRecord().
 	c.Assert(indexCnt(), Equals, 0)
-	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
+	_, err = tb.AddRecord(ctx, types.MakeDatums(1, "abc"), false)
 	c.Assert(err, IsNil)
 	c.Assert(indexCnt(), Greater, 0)
-	// Make sure index data is also removed after tb.Truncate().
-	c.Assert(tb.Truncate(ctx), IsNil)
-	c.Assert(indexCnt(), Equals, 0)
+	handle, found, err := tb.Seek(ctx, 0)
+	c.Assert(handle, Equals, int64(1))
+	c.Assert(found, Equals, true)
+	c.Assert(err, IsNil)
+	_, err = ts.se.Execute(goctx.Background(), "drop table test.t")
+	c.Assert(err, IsNil)
 
-	_, err = ts.se.Execute("drop table test.t")
+	table.MockTableFromMeta(tb.Meta())
+	alc := tb.Allocator()
+	c.Assert(alc, NotNil)
+
+	err = tb.RebaseAutoID(0, false)
 	c.Assert(err, IsNil)
 }
 
 func countEntriesWithPrefix(ctx context.Context, prefix []byte) (int, error) {
-	txn, err := ctx.GetTxn(false)
-	if err != nil {
-		return 0, err
-	}
 	cnt := 0
-	err = util.ScanMetaWithPrefix(txn, prefix, func(k kv.Key, v []byte) bool {
+	err := util.ScanMetaWithPrefix(ctx.Txn(), prefix, func(k kv.Key, v []byte) bool {
 		cnt++
 		return true
 	})
@@ -139,54 +147,54 @@ func countEntriesWithPrefix(ctx context.Context, prefix []byte) (int, error) {
 }
 
 func (ts *testSuite) TestTypes(c *C) {
-	_, err := ts.se.Execute("CREATE TABLE test.t (c1 tinyint, c2 smallint, c3 int, c4 bigint, c5 text, c6 blob, c7 varchar(64), c8 time, c9 timestamp not null default CURRENT_TIMESTAMP, c10 decimal)")
+	_, err := ts.se.Execute(goctx.Background(), "CREATE TABLE test.t (c1 tinyint, c2 smallint, c3 int, c4 bigint, c5 text, c6 blob, c7 varchar(64), c8 time, c9 timestamp null default CURRENT_TIMESTAMP, c10 decimal(10,1))")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
-	dom := sessionctx.GetDomain(ctx)
+	dom := domain.GetDomain(ctx)
 	_, err = dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
-	_, err = ts.se.Execute("insert test.t values (1, 2, 3, 4, '5', '6', '7', '10:10:10', null, 1.4)")
+	_, err = ts.se.Execute(goctx.Background(), "insert test.t values (1, 2, 3, 4, '5', '6', '7', '10:10:10', null, 1.4)")
 	c.Assert(err, IsNil)
-	rs, err := ts.se.Execute("select * from test.t where c1 = 1")
+	rs, err := ts.se.Execute(goctx.Background(), "select * from test.t where c1 = 1")
 	c.Assert(err, IsNil)
 	row, err := rs[0].Next()
 	c.Assert(err, IsNil)
-	c.Assert(row.Data, NotNil)
-	_, err = ts.se.Execute("drop table test.t")
+	c.Assert(row, NotNil)
+	_, err = ts.se.Execute(goctx.Background(), "drop table test.t")
 	c.Assert(err, IsNil)
 
-	_, err = ts.se.Execute("CREATE TABLE test.t (c1 tinyint unsigned, c2 smallint unsigned, c3 int unsigned, c4 bigint unsigned, c5 double, c6 bit(8))")
+	_, err = ts.se.Execute(goctx.Background(), "CREATE TABLE test.t (c1 tinyint unsigned, c2 smallint unsigned, c3 int unsigned, c4 bigint unsigned, c5 double, c6 bit(8))")
 	c.Assert(err, IsNil)
-	_, err = ts.se.Execute("insert test.t values (1, 2, 3, 4, 5, 6)")
+	_, err = ts.se.Execute(goctx.Background(), "insert test.t values (1, 2, 3, 4, 5, 6)")
 	c.Assert(err, IsNil)
-	rs, err = ts.se.Execute("select * from test.t where c1 = 1")
+	rs, err = ts.se.Execute(goctx.Background(), "select * from test.t where c1 = 1")
 	c.Assert(err, IsNil)
 	row, err = rs[0].Next()
 	c.Assert(err, IsNil)
-	c.Assert(row.Data, NotNil)
-	c.Assert(row.Data[5].GetMysqlBit(), Equals, mysql.Bit{Value: 6, Width: 8})
-	_, err = ts.se.Execute("drop table test.t")
+	c.Assert(row, NotNil)
+	c.Assert(types.BinaryLiteral(row.GetBytes(5)), DeepEquals, types.NewBinaryLiteralFromUint(6, -1))
+	_, err = ts.se.Execute(goctx.Background(), "drop table test.t")
 	c.Assert(err, IsNil)
 
-	_, err = ts.se.Execute("CREATE TABLE test.t (c1 enum('a', 'b', 'c'))")
+	_, err = ts.se.Execute(goctx.Background(), "CREATE TABLE test.t (c1 enum('a', 'b', 'c'))")
 	c.Assert(err, IsNil)
-	_, err = ts.se.Execute("insert test.t values ('a'), (2), ('c')")
+	_, err = ts.se.Execute(goctx.Background(), "insert test.t values ('a'), (2), ('c')")
 	c.Assert(err, IsNil)
-	rs, err = ts.se.Execute("select c1 + 1 from test.t where c1 = 1")
+	rs, err = ts.se.Execute(goctx.Background(), "select c1 + 1 from test.t where c1 = 1")
 	c.Assert(err, IsNil)
 	row, err = rs[0].Next()
 	c.Assert(err, IsNil)
-	c.Assert(row.Data, NotNil)
-	c.Assert(row.Data[0].GetFloat64(), DeepEquals, float64(2))
-	_, err = ts.se.Execute("drop table test.t")
+	c.Assert(row, NotNil)
+	c.Assert(row.GetFloat64(0), DeepEquals, float64(2))
+	_, err = ts.se.Execute(goctx.Background(), "drop table test.t")
 	c.Assert(err, IsNil)
 }
 
 func (ts *testSuite) TestUniqueIndexMultipleNullEntries(c *C) {
-	_, err := ts.se.Execute("CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
+	_, err := ts.se.Execute(goctx.Background(), "CREATE TABLE test.t (a int primary key auto_increment, b varchar(255) unique)")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
-	dom := sessionctx.GetDomain(ctx)
+	dom := domain.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	c.Assert(tb.Meta().ID, Greater, int64(0))
@@ -201,12 +209,13 @@ func (ts *testSuite) TestUniqueIndexMultipleNullEntries(c *C) {
 	autoid, err := tb.AllocAutoID()
 	c.Assert(err, IsNil)
 	c.Assert(autoid, Greater, int64(0))
-
-	_, err = tb.AddRecord(ctx, types.MakeDatums(1, nil))
+	c.Assert(ctx.NewTxn(), IsNil)
+	_, err = tb.AddRecord(ctx, types.MakeDatums(1, nil), false)
 	c.Assert(err, IsNil)
-	_, err = tb.AddRecord(ctx, types.MakeDatums(2, nil))
+	_, err = tb.AddRecord(ctx, types.MakeDatums(2, nil), false)
 	c.Assert(err, IsNil)
-	_, err = ts.se.Execute("drop table test.t")
+	c.Assert(ctx.Txn().Rollback(), IsNil)
+	_, err = ts.se.Execute(goctx.Background(), "drop table test.t")
 	c.Assert(err, IsNil)
 }
 
@@ -253,29 +262,33 @@ func (ts *testSuite) TestRowKeyCodec(c *C) {
 
 func (ts *testSuite) TestUnsignedPK(c *C) {
 	defer testleak.AfterTest(c)()
-	_, err := ts.se.Execute("CREATE TABLE test.tPK (a bigint unsigned primary key, b varchar(255))")
+	ts.se.Execute(goctx.Background(), "DROP TABLE IF EXISTS test.tPK")
+	_, err := ts.se.Execute(goctx.Background(), "CREATE TABLE test.tPK (a bigint unsigned primary key, b varchar(255))")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
-	dom := sessionctx.GetDomain(ctx)
+	dom := domain.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tPK"))
 	c.Assert(err, IsNil)
-
-	rid, err := tb.AddRecord(ctx, types.MakeDatums(1, "abc"))
+	c.Assert(ctx.NewTxn(), IsNil)
+	rid, err := tb.AddRecord(ctx, types.MakeDatums(1, "abc"), false)
 	c.Assert(err, IsNil)
 	row, err := tb.Row(ctx, rid)
 	c.Assert(err, IsNil)
 	c.Assert(len(row), Equals, 2)
 	c.Assert(row[0].Kind(), Equals, types.KindUint64)
+	c.Assert(ctx.Txn().Commit(goctx.Background()), IsNil)
 }
 
 func (ts *testSuite) TestIterRecords(c *C) {
 	defer testleak.AfterTest(c)()
-	_, err := ts.se.Execute("CREATE TABLE test.tIter (a int primary key, b int)")
+	ts.se.Execute(goctx.Background(), "DROP TABLE IF EXISTS test.tIter")
+	_, err := ts.se.Execute(goctx.Background(), "CREATE TABLE test.tIter (a int primary key, b int)")
 	c.Assert(err, IsNil)
-	_, err = ts.se.Execute("INSERT test.tIter VALUES (1, 2), (2, NULL)")
+	_, err = ts.se.Execute(goctx.Background(), "INSERT test.tIter VALUES (-1, 2), (2, NULL)")
 	c.Assert(err, IsNil)
 	ctx := ts.se.(context.Context)
-	dom := sessionctx.GetDomain(ctx)
+	c.Assert(ctx.NewTxn(), IsNil)
+	dom := domain.GetDomain(ctx)
 	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("tIter"))
 	c.Assert(err, IsNil)
 	totalCount := 0
@@ -286,4 +299,26 @@ func (ts *testSuite) TestIterRecords(c *C) {
 	})
 	c.Assert(err, IsNil)
 	c.Assert(totalCount, Equals, 2)
+	c.Assert(ctx.Txn().Commit(goctx.Background()), IsNil)
+}
+
+func (ts *testSuite) TestTableFromMeta(c *C) {
+	defer testleak.AfterTest(c)()
+	_, err := ts.se.Execute(goctx.Background(), "CREATE TABLE test.meta (a int primary key auto_increment, b varchar(255) unique)")
+	c.Assert(err, IsNil)
+	ctx := ts.se.(context.Context)
+	c.Assert(ctx.NewTxn(), IsNil)
+	dom := domain.GetDomain(ctx)
+	tb, err := dom.InfoSchema().TableByName(model.NewCIStr("test"), model.NewCIStr("meta"))
+	tbInfo := tb.Meta()
+	tbInfo.Columns[0].GeneratedExprString = "test"
+	tables.TableFromMeta(nil, tbInfo)
+	tbInfo.Columns[0].State = model.StateNone
+	tb, err = tables.TableFromMeta(nil, tbInfo)
+	c.Assert(tb, IsNil)
+	c.Assert(err, NotNil)
+	tbInfo.State = model.StateNone
+	tb, err = tables.TableFromMeta(nil, tbInfo)
+	c.Assert(tb, IsNil)
+	c.Assert(err, NotNil)
 }

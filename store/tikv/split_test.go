@@ -17,6 +17,8 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/tikv/mock-tikv"
+	"golang.org/x/net/context"
+	goctx "golang.org/x/net/context"
 )
 
 type testSplitSuite struct {
@@ -30,12 +32,10 @@ var _ = Suite(&testSplitSuite{})
 func (s *testSplitSuite) SetUpTest(c *C) {
 	s.cluster = mocktikv.NewCluster()
 	mocktikv.BootstrapWithSingleStore(s.cluster)
-	mvccStore := mocktikv.NewMvccStore()
-	client := mocktikv.NewRPCClient(s.cluster, mvccStore)
-	store, err := newTikvStore("mock-tikv-store", mocktikv.NewPDClient(s.cluster), client, false)
-	c.Assert(err, IsNil)
-	s.store = store
-	s.bo = NewBackoffer(5000)
+	store, err := NewMockTikvStore(WithCluster(s.cluster))
+	c.Check(err, IsNil)
+	s.store = store.(*tikvStore)
+	s.bo = NewBackoffer(5000, context.Background())
 }
 
 func (s *testSplitSuite) begin(c *C) *tikvTxn {
@@ -50,7 +50,7 @@ func (s *testSplitSuite) split(c *C, regionID uint64, key []byte) {
 }
 
 func (s *testSplitSuite) TestSplitBatchGet(c *C) {
-	firstRegion, err := s.store.regionCache.GetRegion(s.bo, []byte("a"))
+	loc, err := s.store.regionCache.LocateKey(s.bo, []byte("a"))
 	c.Assert(err, IsNil)
 
 	txn := s.begin(c)
@@ -64,10 +64,37 @@ func (s *testSplitSuite) TestSplitBatchGet(c *C) {
 		keys:   keys,
 	}
 
-	s.split(c, firstRegion.GetID(), []byte("b"))
-	s.store.regionCache.DropRegion(firstRegion.VerID())
+	s.split(c, loc.Region.id, []byte("b"))
+	s.store.regionCache.DropRegion(loc.Region)
 
 	// mock-tikv will panic if it meets a not-in-region key.
 	err = snapshot.batchGetSingleRegion(s.bo, batch, func([]byte, []byte) {})
+	c.Assert(err, IsNil)
+}
+
+func (s *testSplitSuite) TestStaleEpoch(c *C) {
+	mockPDClient := &mockPDClient{client: s.store.regionCache.pdClient}
+	s.store.regionCache.pdClient = mockPDClient
+
+	loc, err := s.store.regionCache.LocateKey(s.bo, []byte("a"))
+	c.Assert(err, IsNil)
+
+	txn := s.begin(c)
+	err = txn.Set([]byte("a"), []byte("a"))
+	c.Assert(err, IsNil)
+	err = txn.Set([]byte("c"), []byte("c"))
+	c.Assert(err, IsNil)
+	err = txn.Commit(goctx.Background())
+	c.Assert(err, IsNil)
+
+	// Initiate a split and disable the PD client. If it still works, the
+	// new region is updated from kvrpc.
+	s.split(c, loc.Region.id, []byte("b"))
+	mockPDClient.disable()
+
+	txn = s.begin(c)
+	_, err = txn.Get([]byte("a"))
+	c.Assert(err, IsNil)
+	_, err = txn.Get([]byte("c"))
 	c.Assert(err, IsNil)
 }

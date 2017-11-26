@@ -14,10 +14,10 @@
 package codec
 
 import (
+	"fmt"
+
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
 )
 
 // EncodeDecimal encodes a decimal d into a byte slice which can be sorted lexicographically later.
@@ -31,8 +31,7 @@ func EncodeDecimal(b []byte, d types.Datum) []byte {
 	b = append(b, byte(precision), byte(frac))
 	bin, err := dec.ToBin(precision, frac)
 	if err != nil {
-		log.Errorf("should not happen, precision %d, frac %d %v", precision, frac, err)
-		return b
+		panic(fmt.Sprintf("should not happen, precision %d, frac %d %v", precision, frac, err))
 	}
 	b = append(b, bin...)
 	return b
@@ -47,7 +46,7 @@ func DecodeDecimal(b []byte) ([]byte, types.Datum, error) {
 	precision := int(b[0])
 	frac := int(b[1])
 	b = b[2:]
-	dec := new(mysql.MyDecimal)
+	dec := new(types.MyDecimal)
 	binSize, err := dec.FromBin(b, precision, frac)
 	b = b[binSize:]
 	if err != nil {

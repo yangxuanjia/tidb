@@ -14,41 +14,44 @@
 package tidb
 
 import (
-	"flag"
 	"fmt"
-	"net/url"
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/store/tikv"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/auth"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
+	goctx "golang.org/x/net/context"
+	"google.golang.org/grpc"
 )
-
-var store = flag.String("store", "memory", "registered store name, [memory, goleveldb, boltdb]")
 
 func TestT(t *testing.T) {
 	logLevel := os.Getenv("log_level")
-	log.SetLevelByString(logLevel)
+	logutil.InitLogger(&logutil.LogConfig{
+		Level: logLevel,
+	})
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
 var _ = Suite(&testMainSuite{})
 
 type testMainSuite struct {
-	dbName         string
-	createDBSQL    string
-	dropDBSQL      string
-	useDBSQL       string
-	createTableSQL string
-	selectSQL      string
+	dbName string
+	store  kv.Storage
+	dom    *domain.Domain
 }
 
 type brokenStore struct{}
@@ -60,158 +63,22 @@ func (s *brokenStore) Open(schema string) (kv.Storage, error) {
 func (s *testMainSuite) SetUpSuite(c *C) {
 	testleak.BeforeTest()
 	s.dbName = "test_main_db"
-	s.createDBSQL = fmt.Sprintf("create database if not exists %s;", s.dbName)
-	s.dropDBSQL = fmt.Sprintf("drop database %s;", s.dbName)
-	s.useDBSQL = fmt.Sprintf("use %s;", s.dbName)
-	s.createTableSQL = `
-    CREATE TABLE tbl_test(id INT NOT NULL DEFAULT 1, name varchar(255), PRIMARY KEY(id));
-    CREATE TABLE tbl_test1(id INT NOT NULL DEFAULT 2, name varchar(255), PRIMARY KEY(id), INDEX name(name));
-    CREATE TABLE tbl_test2(id INT NOT NULL DEFAULT 3, name varchar(255), PRIMARY KEY(id));`
-	s.selectSQL = `SELECT * from tbl_test;`
-	runtime.GOMAXPROCS(runtime.NumCPU())
+	s.store = newStore(c, s.dbName)
+	dom, err := BootstrapSession(s.store)
+	c.Assert(err, IsNil)
+	s.dom = dom
 }
 
 func (s *testMainSuite) TearDownSuite(c *C) {
 	defer testleak.AfterTest(c)()
+	s.dom.Close()
+	err := s.store.Close()
+	c.Assert(err, IsNil)
 	removeStore(c, s.dbName)
-}
-
-func checkResult(c *C, se Session, affectedRows uint64, insertID uint64) {
-	gotRows := se.AffectedRows()
-	c.Assert(gotRows, Equals, affectedRows)
-
-	gotID := se.LastInsertID()
-	c.Assert(gotID, Equals, insertID)
-}
-
-func (s *testMainSuite) TestConcurrent(c *C) {
-	dbName := "test_concurrent_db"
-	defer removeStore(c, dbName)
-	store := newStore(c, dbName)
-	se := newSession(c, store, dbName)
-	defer store.Close()
-	// create db
-	createDBSQL := fmt.Sprintf("create database if not exists %s;", dbName)
-	dropDBSQL := fmt.Sprintf("drop database %s;", dbName)
-	useDBSQL := fmt.Sprintf("use %s;", dbName)
-	createTableSQL := ` CREATE TABLE test(id INT NOT NULL DEFAULT 1, name varchar(255), PRIMARY KEY(id)); `
-
-	mustExecSQL(c, se, dropDBSQL)
-	mustExecSQL(c, se, createDBSQL)
-	mustExecSQL(c, se, useDBSQL)
-	mustExecSQL(c, se, createTableSQL)
-	wg := &sync.WaitGroup{}
-	f := func(start, count int) {
-		sess := newSession(c, store, dbName)
-		for i := 0; i < count; i++ {
-			// insert data
-			mustExecSQL(c, sess, fmt.Sprintf(`INSERT INTO test VALUES (%d, "hello");`, start+i))
-		}
-		wg.Done()
-	}
-	step := 10
-	for i := 0; i < step; i++ {
-		wg.Add(1)
-		go f(i*step, step)
-	}
-	wg.Wait()
-	mustExecSQL(c, se, dropDBSQL)
-}
-
-func (s *testMainSuite) TestTableInfoMeta(c *C) {
-	store := newStore(c, s.dbName)
-	se := newSession(c, store, s.dbName)
-	defer store.Close()
-
-	// create db
-	mustExecSQL(c, se, s.createDBSQL)
-
-	// use db
-	mustExecSQL(c, se, s.useDBSQL)
-
-	// create table
-	mustExecSQL(c, se, s.createTableSQL)
-
-	// insert data
-	mustExecSQL(c, se, `INSERT INTO tbl_test VALUES (1, "hello");`)
-	checkResult(c, se, 1, 0)
-
-	mustExecSQL(c, se, `INSERT INTO tbl_test VALUES (2, "hello");`)
-	checkResult(c, se, 1, 0)
-
-	mustExecSQL(c, se, `UPDATE tbl_test SET name = "abc" where id = 2;`)
-	checkResult(c, se, 1, 0)
-
-	mustExecSQL(c, se, `DELETE from tbl_test where id = 2;`)
-	checkResult(c, se, 1, 0)
-
-	// select data
-	mustExecMatch(c, se, s.selectSQL, [][]interface{}{{1, []byte("hello")}})
-
-	// drop db
-	mustExecSQL(c, se, s.dropDBSQL)
-}
-
-func (s *testMainSuite) TestInfoSchema(c *C) {
-	store := newStore(c, s.dbName)
-	se := newSession(c, store, s.dbName)
-	rs := mustExecSQL(c, se, "SELECT CHARACTER_SET_NAME FROM INFORMATION_SCHEMA.CHARACTER_SETS WHERE CHARACTER_SET_NAME = 'utf8mb4'")
-	row, err := rs.Next()
-	c.Assert(err, IsNil)
-	match(c, row.Data, "utf8mb4")
-
-	err = store.Close()
-	c.Assert(err, IsNil)
-}
-
-func (s *testMainSuite) TestCaseInsensitive(c *C) {
-	store := newStore(c, s.dbName)
-	se := newSession(c, store, s.dbName)
-	defer store.Close()
-	mustExecSQL(c, se, "create table T (a text, B int)")
-	mustExecSQL(c, se, "insert t (A, b) values ('aaa', 1)")
-	rs := mustExecSQL(c, se, "select * from t")
-	fields, err := rs.Fields()
-	c.Assert(err, IsNil)
-	c.Assert(fields[0].ColumnAsName.O, Equals, "a")
-	c.Assert(fields[1].ColumnAsName.O, Equals, "B")
-	rs = mustExecSQL(c, se, "select A, b from t")
-	fields, err = rs.Fields()
-	c.Assert(err, IsNil)
-	c.Assert(fields[0].ColumnAsName.O, Equals, "A")
-	c.Assert(fields[1].ColumnAsName.O, Equals, "b")
-	mustExecSQL(c, se, "update T set b = B + 1")
-	mustExecSQL(c, se, "update T set B = b + 1")
-	rs = mustExecSQL(c, se, "select b from T")
-	rows, err := GetRows(rs)
-	c.Assert(err, IsNil)
-	match(c, rows[0], 3)
-
-	mustExecSQL(c, se, s.dropDBSQL)
-	err = store.Close()
-	c.Assert(err, IsNil)
-}
-
-// Testcase for delete panic
-func (s *testMainSuite) TestDeletePanic(c *C) {
-	store := newStore(c, s.dbName)
-	se := newSession(c, store, s.dbName)
-	defer store.Close()
-	mustExecSQL(c, se, "create table t (c int)")
-	mustExecSQL(c, se, "insert into t values (1), (2), (3)")
-	mustExecSQL(c, se, "delete from `t` where `c` = ?", 1)
-	rs := mustExecSQL(c, se, "delete from `t` where `c` = ?", 2)
-	c.Assert(rs, IsNil)
 }
 
 // Testcase for arg type.
 func (s *testMainSuite) TestCheckArgs(c *C) {
-	store := newStore(c, s.dbName)
-	se := newSession(c, store, s.dbName)
-	defer store.Close()
-	mustExecSQL(c, se, "create table if not exists t (c datetime)")
-	mustExecSQL(c, se, "insert t values (?)", time.Now())
-	mustExecSQL(c, se, "drop table t")
 	checkArgs(nil, true, false, int8(1), int16(1), int32(1), int64(1), 1,
 		uint8(1), uint16(1), uint32(1), uint64(1), uint(1), float32(1), float64(1),
 		"abc", []byte("abc"), time.Now(), time.Hour, time.Local)
@@ -256,81 +123,81 @@ func (s *testMainSuite) TestRetryOpenStore(c *C) {
 	c.Assert(uint64(elapse), GreaterEqual, uint64(3*time.Second))
 }
 
-func (s *testMainSuite) TestParseDSN(c *C) {
-	tbl := []struct {
-		dsn      string
-		ok       bool
-		storeDSN string
-		dbName   string
-	}{
-		{"s://path/db", true, "s://path", "db"},
-		{"s://path/db/", true, "s://path", "db"},
-		{"s:///path/db", true, "s:///path", "db"},
-		{"s:///path/db/", true, "s:///path", "db"},
-		{"s://zk1,zk2/tbl/db", true, "s://zk1,zk2/tbl", "db"},
-		{"s://zk1:80,zk2:81/tbl/db", true, "s://zk1:80,zk2:81/tbl", "db"},
-		{"s://path/db?p=v", true, "s://path?p=v", "db"},
-		{"s:///path/db?p1=v1&p2=v2", true, "s:///path?p1=v1&p2=v2", "db"},
-		{"s://z,k,zk/tbl/db?p=v", true, "s://z,k,zk/tbl?p=v", "db"},
-		{"", false, "", ""},
-		{"/", false, "", ""},
-		{"s://", false, "", ""},
-		{"s:///", false, "", ""},
-		{"s:///db", false, "", ""},
+func (s *testMainSuite) TestRetryDialPumpClient(c *C) {
+	retryDialPumpClientMustFail := func(binlogSocket string, clientCon *grpc.ClientConn, maxRetries int, dialerOpt grpc.DialOption) (err error) {
+		return util.RunWithRetry(maxRetries, 10, func() (bool, error) {
+			// Assume that it'll always return an error.
+			return true, errors.New("must fail")
+		})
 	}
-
-	for _, t := range tbl {
-		params, err := parseDriverDSN(t.dsn)
-		if t.ok {
-			c.Assert(err, IsNil, Commentf("dsn=%v", t.dsn))
-			c.Assert(params.storePath, Equals, t.storeDSN, Commentf("dsn=%v", t.dsn))
-			c.Assert(params.dbName, Equals, t.dbName, Commentf("dsn=%v", t.dsn))
-			_, err = url.Parse(params.storePath)
-			c.Assert(err, IsNil, Commentf("dsn=%v", t.dsn))
-		} else {
-			c.Assert(err, NotNil, Commentf("dsn=%v", t.dsn))
-		}
-	}
+	begin := time.Now()
+	err := retryDialPumpClientMustFail("", nil, 3, nil)
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "must fail")
+	elapse := time.Since(begin)
+	c.Assert(uint64(elapse), GreaterEqual, uint64(6*10*time.Millisecond))
 }
 
-func (s *testMainSuite) TestTPS(c *C) {
-	store := newStore(c, s.dbName)
-	se := newSession(c, store, s.dbName)
+func (s *testMainSuite) TestSysSessionPoolGoroutineLeak(c *C) {
+	c.Skip("make leak should check it")
+	// TODO: testleak package should be able to find this leak.
+	store, dom := newStoreWithBootstrap(c, s.dbName+"goroutine_leak")
+	defer dom.Close()
 	defer store.Close()
-
-	mustExecSQL(c, se, "set @@autocommit=0;")
-	for i := 1; i < 6; i++ {
-		for j := 0; j < 5; j++ {
-			for k := 0; k < i; k++ {
-				mustExecSQL(c, se, "begin;")
-				mustExecSQL(c, se, "select 1;")
-				mustExecSQL(c, se, "commit;")
-			}
-			time.Sleep(220 * time.Millisecond)
-		}
-		// It is hard to get the accurate tps because there is another timeline in tpsMetrics.
-		// We could only get the upper/lower boundary for tps
-		c.Assert(GetTPS(), GreaterEqual, int64(4*(i-1)))
-	}
-}
-func sessionExec(c *C, se Session, sql string) ([]ast.RecordSet, error) {
-	se.Execute("BEGIN;")
-	r, err := se.Execute(sql)
+	se, err := createSession(store)
 	c.Assert(err, IsNil)
-	se.Execute("COMMIT;")
-	return r, err
+
+	// Test an issue that sysSessionPool doesn't call session's Close, cause
+	// asyncGetTSWorker goroutine leak.
+	before := runtime.NumGoroutine()
+	count := 200
+	var wg sync.WaitGroup
+	wg.Add(count)
+	for i := 0; i < count; i++ {
+		go func(se *session) {
+			_, _, err := se.ExecRestrictedSQL(se, "select * from mysql.user limit 1")
+			c.Assert(err, IsNil)
+			wg.Done()
+		}(se)
+	}
+	wg.Wait()
+	se.sysSessionPool().Close()
+	c.Assert(se.sysSessionPool().IsClosed(), Equals, true)
+	for i := 0; i < 300; i++ {
+		// After and before should be Equal, but this test may be disturbed by other factors.
+		// So I relax the strict check to make CI more stable.
+		after := runtime.NumGoroutine()
+		if after-before < 3 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	after := runtime.NumGoroutine()
+	c.Assert(after-before, Less, 3)
 }
 
 func newStore(c *C, dbPath string) kv.Storage {
-	store, err := NewStore(*store + "://" + dbPath)
+	store, err := tikv.NewMockTikvStore()
 	c.Assert(err, IsNil)
 	return store
 }
 
+func newStoreWithBootstrap(c *C, dbPath string) (kv.Storage, *domain.Domain) {
+	store, err := tikv.NewMockTikvStore()
+	c.Assert(err, IsNil)
+	dom, err := BootstrapSession(store)
+	c.Assert(err, IsNil)
+	return store, dom
+}
+
+var testConnID uint64
+
 func newSession(c *C, store kv.Storage, dbName string) Session {
 	se, err := CreateSession(store)
+	id := atomic.AddUint64(&testConnID, 1)
+	se.SetConnectionID(id)
 	c.Assert(err, IsNil)
-	se.Auth("root@%", nil, []byte("012345678901234567890"))
+	se.Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, []byte("012345678901234567890"))
 	mustExecSQL(c, se, "create database if not exists "+dbName)
 	mustExecSQL(c, se, "use "+dbName)
 	return se
@@ -342,7 +209,7 @@ func removeStore(c *C, dbPath string) {
 
 func exec(se Session, sql string, args ...interface{}) (ast.RecordSet, error) {
 	if len(args) == 0 {
-		rs, err := se.Execute(sql)
+		rs, err := se.Execute(goctx.Background(), sql)
 		if err == nil && len(rs) > 0 {
 			return rs[0], nil
 		}
@@ -372,20 +239,6 @@ func match(c *C, row []types.Datum, expected ...interface{}) {
 		need := fmt.Sprintf("%v", expected[i])
 		c.Assert(got, Equals, need)
 	}
-}
-
-func matches(c *C, rows [][]types.Datum, expected [][]interface{}) {
-	c.Assert(len(rows), Equals, len(expected))
-	for i := 0; i < len(rows); i++ {
-		match(c, rows[i], expected[i]...)
-	}
-}
-
-func mustExecMatch(c *C, se Session, sql string, expected [][]interface{}) {
-	r := mustExecSQL(c, se, sql)
-	rows, err := GetRows(r)
-	c.Assert(err, IsNil)
-	matches(c, rows, expected)
 }
 
 func mustExecFailed(c *C, se Session, sql string, args ...interface{}) {

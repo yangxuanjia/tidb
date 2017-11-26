@@ -16,6 +16,7 @@ package tikv
 import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/kv"
+	goctx "golang.org/x/net/context"
 )
 
 type testScanMockSuite struct {
@@ -35,7 +36,7 @@ func (s *testScanMockSuite) TestScanMultipleRegions(c *C) {
 		err = txn.Set([]byte{ch}, []byte{ch})
 		c.Assert(err, IsNil)
 	}
-	err = txn.Commit()
+	err = txn.Commit(goctx.Background())
 	c.Assert(err, IsNil)
 
 	txn, err = store.Begin()
@@ -45,10 +46,7 @@ func (s *testScanMockSuite) TestScanMultipleRegions(c *C) {
 	c.Assert(err, IsNil)
 	for ch := byte('a'); ch <= byte('z'); ch++ {
 		c.Assert([]byte{ch}, BytesEquals, []byte(scanner.Key()))
-		if ch < byte('z') {
-			c.Assert(scanner.Next(), IsNil)
-		}
+		c.Assert(scanner.Next(), IsNil)
 	}
-	c.Assert(scanner.Next(), NotNil)
 	c.Assert(scanner.Valid(), IsFalse)
 }

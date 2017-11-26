@@ -17,14 +17,19 @@ import (
 	"bytes"
 	"math"
 	"testing"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/types/json"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -64,12 +69,12 @@ func (s *testCodecSuite) TestCodecKey(c *C) {
 		},
 
 		{
-			types.MakeDatums(mysql.Hex{Value: 100}, mysql.Bit{Value: 100, Width: 8}),
-			types.MakeDatums(int64(100), uint64(100)),
+			types.MakeDatums(types.NewBinaryLiteralFromUint(100, -1), types.NewBinaryLiteralFromUint(100, 4)),
+			types.MakeDatums(uint64(100), uint64(100)),
 		},
 
 		{
-			types.MakeDatums(mysql.Enum{Name: "a", Value: 1}, mysql.Set{Name: "a", Value: 1}),
+			types.MakeDatums(types.Enum{Name: "a", Value: 1}, types.Set{Name: "a", Value: 1}),
 			types.MakeDatums(uint64(1), uint64(1)),
 		},
 	}
@@ -237,6 +242,11 @@ func (s *testCodecSuite) TestNumberCodec(c *C) {
 		_, v, err = DecodeVarint(b)
 		c.Assert(err, IsNil)
 		c.Assert(v, Equals, t)
+
+		b = EncodeComparableVarint(nil, t)
+		_, v, err = DecodeComparableVarint(b)
+		c.Assert(err, IsNil)
+		c.Assert(v, Equals, t)
 	}
 
 	tblUint64 := []uint64{
@@ -270,7 +280,25 @@ func (s *testCodecSuite) TestNumberCodec(c *C) {
 		_, v, err = DecodeUvarint(b)
 		c.Assert(err, IsNil)
 		c.Assert(v, Equals, t)
+
+		b = EncodeComparableUvarint(nil, t)
+		_, v, err = DecodeComparableUvarint(b)
+		c.Assert(err, IsNil)
+		c.Assert(v, Equals, t)
 	}
+	var b []byte
+	b = EncodeComparableVarint(b, -1)
+	b = EncodeComparableUvarint(b, 1)
+	b = EncodeComparableVarint(b, 2)
+	b, i, err := DecodeComparableVarint(b)
+	c.Assert(err, IsNil)
+	c.Assert(i, Equals, int64(-1))
+	b, u, err := DecodeComparableUvarint(b)
+	c.Assert(err, IsNil)
+	c.Assert(u, Equals, uint64(1))
+	_, i, err = DecodeComparableVarint(b)
+	c.Assert(err, IsNil)
+	c.Assert(i, Equals, int64(2))
 }
 
 func (s *testCodecSuite) TestNumberOrder(c *C) {
@@ -307,6 +335,11 @@ func (s *testCodecSuite) TestNumberOrder(c *C) {
 
 		ret = bytes.Compare(b1, b2)
 		c.Assert(ret, Equals, -t.Ret)
+
+		b1 = EncodeComparableVarint(nil, t.Arg1)
+		b2 = EncodeComparableVarint(nil, t.Arg2)
+		ret = bytes.Compare(b1, b2)
+		c.Assert(ret, Equals, t.Ret)
 	}
 
 	tblUint64 := []struct {
@@ -339,6 +372,11 @@ func (s *testCodecSuite) TestNumberOrder(c *C) {
 
 		ret = bytes.Compare(b1, b2)
 		c.Assert(ret, Equals, -t.Ret)
+
+		b1 = EncodeComparableUvarint(nil, t.Arg1)
+		b2 = EncodeComparableUvarint(nil, t.Arg2)
+		ret = bytes.Compare(b1, b2)
+		c.Assert(ret, Equals, t.Ret)
 	}
 }
 
@@ -467,14 +505,14 @@ func (s *testCodecSuite) TestBytes(c *C) {
 	}
 }
 
-func parseTime(c *C, s string) mysql.Time {
-	m, err := mysql.ParseTime(s, mysql.TypeDatetime, mysql.DefaultFsp)
+func parseTime(c *C, s string) types.Time {
+	m, err := types.ParseTime(nil, s, mysql.TypeDatetime, types.DefaultFsp)
 	c.Assert(err, IsNil)
 	return m
 }
 
-func parseDuration(c *C, s string) mysql.Duration {
-	m, err := mysql.ParseDuration(s, mysql.DefaultFsp)
+func parseDuration(c *C, s string) types.Duration {
+	m, err := types.ParseDuration(s, types.DefaultFsp)
 	c.Assert(err, IsNil)
 	return m
 }
@@ -494,9 +532,10 @@ func (s *testCodecSuite) TestTime(c *C) {
 		c.Assert(err, IsNil)
 		v, err := Decode(b, 1)
 		c.Assert(err, IsNil)
-		var t mysql.Time
+		var t types.Time
 		t.Type = mysql.TypeDatetime
 		t.FromPackedUint(v[0].GetUint64())
+		t.TimeZone = nil
 		c.Assert(types.NewDatum(t), DeepEquals, m)
 	}
 
@@ -539,7 +578,7 @@ func (s *testCodecSuite) TestDuration(c *C) {
 		c.Assert(err, IsNil)
 		v, err := Decode(b, 1)
 		c.Assert(err, IsNil)
-		m.Fsp = mysql.MaxFsp
+		m.Fsp = types.MaxFsp
 		c.Assert(v, DeepEquals, types.MakeDatums(m))
 	}
 
@@ -587,7 +626,7 @@ func (s *testCodecSuite) TestDecimal(c *C) {
 	}
 
 	for _, t := range tbl {
-		dec := new(mysql.MyDecimal)
+		dec := new(types.MyDecimal)
 		err := dec.FromString([]byte(t))
 		c.Assert(err, IsNil)
 		b, err := EncodeKey(nil, types.NewDatum(dec))
@@ -664,14 +703,14 @@ func (s *testCodecSuite) TestDecimal(c *C) {
 		{uint64(math.MaxUint64), uint64(0), 1},
 		{uint64(0), uint64(math.MaxUint64), -1},
 	}
-
+	sc := new(stmtctx.StatementContext)
 	for _, t := range tblCmp {
 		d1 := types.NewDatum(t.Arg1)
-		dec1, err := d1.ToDecimal()
+		dec1, err := d1.ToDecimal(sc)
 		c.Assert(err, IsNil)
 		d1.SetMysqlDecimal(dec1)
 		d2 := types.NewDatum(t.Arg2)
-		dec2, err := d2.ToDecimal()
+		dec2, err := d2.ToDecimal(sc)
 		c.Assert(err, IsNil)
 		d2.SetMysqlDecimal(dec2)
 
@@ -690,9 +729,9 @@ func (s *testCodecSuite) TestDecimal(c *C) {
 
 	floats := []float64{-123.45, -123.40, -23.45, -1.43, -0.93, -0.4333, -0.068,
 		-0.0099, 0, 0.001, 0.0012, 0.12, 1.2, 1.23, 123.3, 2424.242424}
-	var decs [][]byte
+	decs := make([][]byte, 0, len(floats))
 	for i := range floats {
-		dec := mysql.NewDecFromFloatForTest(floats[i])
+		dec := types.NewDecFromFloatForTest(floats[i])
 		var d types.Datum
 		d.SetLength(20)
 		d.SetFrac(6)
@@ -702,6 +741,36 @@ func (s *testCodecSuite) TestDecimal(c *C) {
 	for i := 0; i < len(decs)-1; i++ {
 		cmp := bytes.Compare(decs[i], decs[i+1])
 		c.Assert(cmp, LessEqual, 0)
+	}
+}
+
+func (s *testCodecSuite) TestJSON(c *C) {
+	defer testleak.AfterTest(c)()
+	tbl := []string{
+		"1234.00",
+		`{"a": "b"}`,
+	}
+
+	datums := make([]types.Datum, 0, len(tbl))
+	for _, t := range tbl {
+		var d types.Datum
+		j, err := json.ParseFromString(t)
+		c.Assert(err, IsNil)
+		d.SetMysqlJSON(j)
+		datums = append(datums, d)
+	}
+
+	bytes := make([]byte, 0, 4096)
+	bytes, err := encode(bytes, datums, false, false)
+	c.Assert(err, IsNil)
+
+	datums1, err := Decode(bytes, 2)
+	c.Assert(err, IsNil)
+
+	for i := range datums1 {
+		lhs := datums[i].GetMysqlJSON().String()
+		rhs := datums1[i].GetMysqlJSON().String()
+		c.Assert(lhs, Equals, rhs)
 	}
 }
 
@@ -736,12 +805,12 @@ func (s *testCodecSuite) TestCut(c *C) {
 		},
 
 		{
-			types.MakeDatums(mysql.Hex{Value: 100}, mysql.Bit{Value: 100, Width: 8}),
-			types.MakeDatums(int64(100), uint64(100)),
+			types.MakeDatums(types.NewBinaryLiteralFromUint(100, -1), types.NewBinaryLiteralFromUint(100, 4)),
+			types.MakeDatums(uint64(100), uint64(100)),
 		},
 
 		{
-			types.MakeDatums(mysql.Enum{Name: "a", Value: 1}, mysql.Set{Name: "a", Value: 1}),
+			types.MakeDatums(types.Enum{Name: "a", Value: 1}, types.Set{Name: "a", Value: 1}),
 			types.MakeDatums(uint64(1), uint64(1)),
 		},
 		{
@@ -749,8 +818,8 @@ func (s *testCodecSuite) TestCut(c *C) {
 			types.MakeDatums(float64(1), float64(3.15), []byte("123456789012345")),
 		},
 		{
-			types.MakeDatums(mysql.NewDecFromInt(0), mysql.NewDecFromFloatForTest(-1.3)),
-			types.MakeDatums(mysql.NewDecFromInt(0), mysql.NewDecFromFloatForTest(-1.3)),
+			types.MakeDatums(types.NewDecFromInt(0), types.NewDecFromFloatForTest(-1.3)),
+			types.MakeDatums(types.NewDecFromInt(0), types.NewDecFromFloatForTest(-1.3)),
 		},
 	}
 	for i, t := range table {
@@ -782,5 +851,90 @@ func (s *testCodecSuite) TestCut(c *C) {
 			c.Assert(d, DeepEquals, ed, Commentf("%d:%d %#v", i, j, e))
 		}
 		c.Assert(b, HasLen, 0)
+	}
+}
+
+func (s *testCodecSuite) TestSetRawValues(c *C) {
+	datums := types.MakeDatums(1, "abc", 1.1, []byte("def"))
+	rowData, err := EncodeValue(nil, datums...)
+	c.Assert(err, IsNil)
+	values := make([]types.Datum, 4)
+	err = SetRawValues(rowData, values)
+	c.Assert(err, IsNil)
+	for i, rawVal := range values {
+		c.Assert(rawVal.Kind(), Equals, types.KindRaw)
+		encoded, err1 := EncodeValue(nil, datums[i])
+		c.Assert(err1, IsNil)
+		c.Assert(encoded, BytesEquals, rawVal.GetBytes())
+	}
+}
+
+func (s *testCodecSuite) TestDecodeOneToChunk(c *C) {
+	defer testleak.AfterTest(c)()
+	table := []struct {
+		value interface{}
+		tp    *types.FieldType
+	}{
+		{nil, types.NewFieldType(mysql.TypeLonglong)},
+		{int64(1), types.NewFieldType(mysql.TypeTiny)},
+		{int64(1), types.NewFieldType(mysql.TypeShort)},
+		{int64(1), types.NewFieldType(mysql.TypeInt24)},
+		{int64(1), types.NewFieldType(mysql.TypeLong)},
+		{int64(1), types.NewFieldType(mysql.TypeLonglong)},
+		{float32(1), types.NewFieldType(mysql.TypeFloat)},
+		{float64(1), types.NewFieldType(mysql.TypeDouble)},
+		{types.NewDecFromInt(1), types.NewFieldType(mysql.TypeNewDecimal)},
+		{"abc", types.NewFieldType(mysql.TypeString)},
+		{"def", types.NewFieldType(mysql.TypeVarchar)},
+		{"ghi", types.NewFieldType(mysql.TypeVarString)},
+		{[]byte("abc"), types.NewFieldType(mysql.TypeBlob)},
+		{[]byte("abc"), types.NewFieldType(mysql.TypeTinyBlob)},
+		{[]byte("abc"), types.NewFieldType(mysql.TypeMediumBlob)},
+		{[]byte("abc"), types.NewFieldType(mysql.TypeLongBlob)},
+		{types.CurrentTime(mysql.TypeDatetime), types.NewFieldType(mysql.TypeDatetime)},
+		{types.CurrentTime(mysql.TypeDate), types.NewFieldType(mysql.TypeDate)},
+		{types.Time{
+			Time:     types.FromGoTime(time.Now()),
+			Type:     mysql.TypeTimestamp,
+			TimeZone: time.Local,
+		}, types.NewFieldType(mysql.TypeTimestamp)},
+		{types.Duration{Duration: time.Second, Fsp: 1}, types.NewFieldType(mysql.TypeDuration)},
+		{types.Enum{Name: "a", Value: 0}, &types.FieldType{Tp: mysql.TypeEnum, Elems: []string{"a"}}},
+		{types.Set{Name: "a", Value: 0}, &types.FieldType{Tp: mysql.TypeSet, Elems: []string{"a"}}},
+		{types.BinaryLiteral{100}, &types.FieldType{Tp: mysql.TypeBit, Flen: 8}},
+		{json.CreateJSON("abc"), types.NewFieldType(mysql.TypeJSON)},
+		{int64(1), types.NewFieldType(mysql.TypeYear)},
+	}
+
+	datums := make([]types.Datum, 0, len(table))
+	tps := make([]*types.FieldType, 0, len(table))
+	for _, t := range table {
+		tps = append(tps, t.tp)
+		datums = append(datums, types.NewDatum(t.value))
+	}
+	chk := chunk.NewChunk(tps)
+	rowCount := 3
+	for rowIdx := 0; rowIdx < rowCount; rowIdx++ {
+		encoded, err := EncodeValue(nil, datums...)
+		c.Assert(err, IsNil)
+		for colIdx, t := range table {
+			encoded, err = DecodeOneToChunk(encoded, chk, colIdx, t.tp, time.Local)
+			c.Assert(err, IsNil)
+		}
+	}
+
+	sc := new(stmtctx.StatementContext)
+	for colIdx, t := range table {
+		for rowIdx := 0; rowIdx < rowCount; rowIdx++ {
+			got := chk.GetRow(rowIdx).GetDatum(colIdx, t.tp)
+			expect := datums[colIdx]
+			if got.IsNull() {
+				c.Assert(expect.IsNull(), IsTrue)
+			} else {
+				cmp, err := got.CompareDatum(sc, &expect)
+				c.Assert(err, IsNil)
+				c.Assert(cmp, Equals, 0)
+			}
+		}
 	}
 }

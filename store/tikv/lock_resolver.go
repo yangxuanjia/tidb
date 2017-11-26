@@ -15,53 +15,104 @@ package tikv
 
 import (
 	"container/list"
+	"fmt"
 	"sync"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/pd/pd-client"
+	"github.com/pingcap/tidb/store/tikv/tikvrpc"
+	goctx "golang.org/x/net/context"
 )
 
 const resolvedCacheSize = 512
 
 // LockResolver resolves locks and also caches resolved txn status.
 type LockResolver struct {
-	store *tikvStore
+	store Storage
 	mu    struct {
 		sync.RWMutex
-		// Cache resolved txns (FIFO, txn id -> txnStatus).
-		resolved       map[uint64]txnStatus
+		// resolved caches resolved txns (FIFO, txn id -> txnStatus).
+		resolved       map[uint64]TxnStatus
 		recentResolved *list.List
 	}
 }
 
-// NewLockResolver creates a LockResolver.
-func NewLockResolver(store *tikvStore) *LockResolver {
+func newLockResolver(store Storage) *LockResolver {
 	r := &LockResolver{
 		store: store,
 	}
-	r.mu.resolved = make(map[uint64]txnStatus)
+	r.mu.resolved = make(map[uint64]TxnStatus)
 	r.mu.recentResolved = list.New()
 	return r
 }
 
-type txnStatus uint64
+// NewLockResolver creates a LockResolver.
+// It is exported for other services to use. For instance, binlog service needs
+// to determine a transaction's commit state.
+func NewLockResolver(etcdAddrs []string) (*LockResolver, error) {
+	pdCli, err := pd.NewClient(etcdAddrs)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	uuid := fmt.Sprintf("tikv-%v", pdCli.GetClusterID(goctx.TODO()))
 
-func (s txnStatus) isCommitted() bool { return s > 0 }
-func (s txnStatus) commitTS() uint64  { return uint64(s) }
+	spkv, err := NewEtcdSafePointKV(etcdAddrs)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
 
-// locks after 3000ms is considered unusual (the client created the lock might
-// be dead). Other client may cleanup this kind of lock.
+	s, err := newTikvStore(uuid, &codecPDClient{pdCli}, spkv, newRPCClient(), false)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return s.lockResolver, nil
+}
+
+// TxnStatus represents a txn's final status. It should be Commit or Rollback.
+type TxnStatus uint64
+
+// IsCommitted returns true if the txn's final status is Commit.
+func (s TxnStatus) IsCommitted() bool { return s > 0 }
+
+// CommitTS returns the txn's commitTS. It is valid iff `IsCommitted` is true.
+func (s TxnStatus) CommitTS() uint64 { return uint64(s) }
+
+// By default, locks after 3000ms is considered unusual (the client created the
+// lock might be dead). Other client may cleanup this kind of lock.
 // For locks created recently, we will do backoff and retry.
-var lockTTL uint64 = 3000
+var defaultLockTTL uint64 = 3000
+
+// TODO: Consider if it's appropriate.
+var maxLockTTL uint64 = 120000
+
+// ttl = ttlFactor * sqrt(writeSizeInMiB)
+var ttlFactor = 6000
 
 // Lock represents a lock from tikv server.
 type Lock struct {
 	Key     []byte
 	Primary []byte
 	TxnID   uint64
+	TTL     uint64
 }
 
-func (lr *LockResolver) saveResolved(txnID uint64, status txnStatus) {
+// NewLock creates a new *Lock.
+func NewLock(l *kvrpcpb.LockInfo) *Lock {
+	ttl := l.GetLockTtl()
+	if ttl == 0 {
+		ttl = defaultLockTTL
+	}
+	return &Lock{
+		Key:     l.GetKey(),
+		Primary: l.GetPrimaryLock(),
+		TxnID:   l.GetLockVersion(),
+		TTL:     ttl,
+	}
+}
+
+func (lr *LockResolver) saveResolved(txnID uint64, status TxnStatus) {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
 
@@ -77,7 +128,7 @@ func (lr *LockResolver) saveResolved(txnID uint64, status txnStatus) {
 	}
 }
 
-func (lr *LockResolver) getResolved(txnID uint64) (txnStatus, bool) {
+func (lr *LockResolver) getResolved(txnID uint64) (TxnStatus, bool) {
 	lr.mu.RLock()
 	defer lr.mu.RUnlock()
 
@@ -87,9 +138,9 @@ func (lr *LockResolver) getResolved(txnID uint64) (txnStatus, bool) {
 
 // ResolveLocks tries to resolve Locks. The resolving process is in 3 steps:
 // 1) Use the `lockTTL` to pick up all expired locks. Only locks that are too
-//    old are considerd orphan locks and will be handled later. If all locks are
-//    expired then all locks will be resolved so the returned `ok` will be true,
-//    otherwise caller should sleep a while before retry.
+//    old are considered orphan locks and will be handled later. If all locks
+//    are expired then all locks will be resolved so the returned `ok` will be
+//    true, otherwise caller should sleep a while before retry.
 // 2) For each lock, query the primary key to get txn(which left the lock)'s
 //    commit status.
 // 3) Send `ResolveLock` cmd to the lock's region to resolve all locks belong to
@@ -99,10 +150,15 @@ func (lr *LockResolver) ResolveLocks(bo *Backoffer, locks []*Lock) (ok bool, err
 		return true, nil
 	}
 
+	lockResolverCounter.WithLabelValues("resolve").Inc()
+
 	var expiredLocks []*Lock
 	for _, l := range locks {
-		if lr.store.oracle.IsExpired(l.TxnID, lockTTL) {
+		if lr.store.GetOracle().IsExpired(l.TxnID, l.TTL) {
+			lockResolverCounter.WithLabelValues("expired").Inc()
 			expiredLocks = append(expiredLocks, l)
+		} else {
+			lockResolverCounter.WithLabelValues("not_expired").Inc()
 		}
 	}
 	if len(expiredLocks) == 0 {
@@ -132,86 +188,115 @@ func (lr *LockResolver) ResolveLocks(bo *Backoffer, locks []*Lock) (ok bool, err
 	return len(expiredLocks) == len(locks), nil
 }
 
-func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte) (txnStatus, error) {
+// GetTxnStatus queries tikv-server for a txn's status (commit/rollback).
+// If the primary key is still locked, it will launch a Rollback to abort it.
+// To avoid unnecessarily aborting too many txns, it is wiser to wait a few
+// seconds before calling it after Prewrite.
+func (lr *LockResolver) GetTxnStatus(txnID uint64, primary []byte) (TxnStatus, error) {
+	bo := NewBackoffer(cleanupMaxBackoff, goctx.Background())
+	status, err := lr.getTxnStatus(bo, txnID, primary)
+	return status, errors.Trace(err)
+}
+
+func (lr *LockResolver) getTxnStatus(bo *Backoffer, txnID uint64, primary []byte) (TxnStatus, error) {
 	if s, ok := lr.getResolved(txnID); ok {
 		return s, nil
 	}
-	var status txnStatus
-	req := &kvrpcpb.Request{
-		Type: kvrpcpb.MessageType_CmdCleanup,
-		CmdCleanupReq: &kvrpcpb.CmdCleanupRequest{
+
+	lockResolverCounter.WithLabelValues("query_txn_status").Inc()
+
+	var status TxnStatus
+	req := &tikvrpc.Request{
+		Type: tikvrpc.CmdCleanup,
+		Cleanup: &kvrpcpb.CleanupRequest{
 			Key:          primary,
 			StartVersion: txnID,
 		},
 	}
 	for {
-		region, err := lr.store.regionCache.GetRegion(bo, primary)
+		loc, err := lr.store.GetRegionCache().LocateKey(bo, primary)
 		if err != nil {
 			return status, errors.Trace(err)
 		}
-		resp, err := lr.store.SendKVReq(bo, req, region.VerID())
+		resp, err := lr.store.SendReq(bo, req, loc.Region, readTimeoutShort)
 		if err != nil {
 			return status, errors.Trace(err)
 		}
-		if regionErr := resp.GetRegionError(); regionErr != nil {
-			err = bo.Backoff(boRegionMiss, errors.New(regionErr.String()))
+		regionErr, err := resp.GetRegionError()
+		if err != nil {
+			return status, errors.Trace(err)
+		}
+		if regionErr != nil {
+			err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
 			if err != nil {
 				return status, errors.Trace(err)
 			}
 			continue
 		}
-		cmdResp := resp.GetCmdCleanupResp()
+		cmdResp := resp.Cleanup
 		if cmdResp == nil {
-			return status, errors.Trace(errBodyMissing)
+			return status, errors.Trace(ErrBodyMissing)
 		}
 		if keyErr := cmdResp.GetError(); keyErr != nil {
-			return status, errors.Errorf("unexpected cleanup err: %s", keyErr)
+			err = errors.Errorf("unexpected cleanup err: %s, tid: %v", keyErr, txnID)
+			log.Error(err)
+			return status, err
 		}
 		if cmdResp.CommitVersion != 0 {
-			status = txnStatus(cmdResp.GetCommitVersion())
+			status = TxnStatus(cmdResp.GetCommitVersion())
+			lockResolverCounter.WithLabelValues("query_txn_status_committed").Inc()
+		} else {
+			lockResolverCounter.WithLabelValues("query_txn_status_rolled_back").Inc()
 		}
 		lr.saveResolved(txnID, status)
 		return status, nil
 	}
 }
 
-func (lr *LockResolver) resolveLock(bo *Backoffer, l *Lock, status txnStatus, cleanRegions map[RegionVerID]struct{}) error {
+func (lr *LockResolver) resolveLock(bo *Backoffer, l *Lock, status TxnStatus, cleanRegions map[RegionVerID]struct{}) error {
+	lockResolverCounter.WithLabelValues("query_resolve_locks").Inc()
 	for {
-		region, err := lr.store.regionCache.GetRegion(bo, l.Key)
+		loc, err := lr.store.GetRegionCache().LocateKey(bo, l.Key)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		if _, ok := cleanRegions[region.VerID()]; ok {
+		if _, ok := cleanRegions[loc.Region]; ok {
 			return nil
 		}
-		req := &kvrpcpb.Request{
-			Type: kvrpcpb.MessageType_CmdResolveLock,
-			CmdResolveLockReq: &kvrpcpb.CmdResolveLockRequest{
+		req := &tikvrpc.Request{
+			Type: tikvrpc.CmdResolveLock,
+			ResolveLock: &kvrpcpb.ResolveLockRequest{
 				StartVersion: l.TxnID,
 			},
 		}
-		if status.isCommitted() {
-			req.GetCmdResolveLockReq().CommitVersion = status.commitTS()
+		if status.IsCommitted() {
+			req.ResolveLock.CommitVersion = status.CommitTS()
 		}
-		resp, err := lr.store.SendKVReq(bo, req, region.VerID())
+		resp, err := lr.store.SendReq(bo, req, loc.Region, readTimeoutShort)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		if regionErr := resp.GetRegionError(); regionErr != nil {
-			err = bo.Backoff(boRegionMiss, errors.New(regionErr.String()))
+		regionErr, err := resp.GetRegionError()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if regionErr != nil {
+			err = bo.Backoff(BoRegionMiss, errors.New(regionErr.String()))
 			if err != nil {
 				return errors.Trace(err)
 			}
 			continue
 		}
-		cmdResp := resp.GetCmdResolveLockResp()
+		cmdResp := resp.ResolveLock
 		if cmdResp == nil {
-			return errors.Trace(errBodyMissing)
+			return errors.Trace(ErrBodyMissing)
 		}
 		if keyErr := cmdResp.GetError(); keyErr != nil {
-			return errors.Errorf("unexpected resolve err: %s", keyErr)
+			err = errors.Errorf("unexpected resolve err: %s, lock: %v", keyErr, l)
+			log.Error(err)
+			return err
 		}
-		cleanRegions[region.VerID()] = struct{}{}
+		cleanRegions[loc.Region] = struct{}{}
 		return nil
 	}
 }

@@ -14,19 +14,24 @@
 package server
 
 import (
+	"crypto/tls"
 	"fmt"
 
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/auth"
+	"github.com/pingcap/tidb/util/chunk"
+	goctx "golang.org/x/net/context"
 )
 
 // IDriver opens IContext.
 type IDriver interface {
-	// OpenCtx opens an IContext with connection id, client capability, collation and dbname.
-	OpenCtx(connID uint64, capability uint32, collation uint8, dbname string) (IContext, error)
+	// OpenCtx opens an IContext with connection id, client capability, collation, dbname and optionally the tls state.
+	OpenCtx(connID uint64, capability uint32, collation uint8, dbname string, tlsState *tls.ConnectionState) (QueryCtx, error)
 }
 
-// IContext is the interface to execute command.
-type IContext interface {
+// QueryCtx is the interface to execute command.
+type QueryCtx interface {
 	// Status returns server status code.
 	Status() uint16
 
@@ -43,7 +48,7 @@ type IContext interface {
 	SetValue(key fmt.Stringer, value interface{})
 
 	// CommitTxn commits the transaction operations.
-	CommitTxn() error
+	CommitTxn(goCtx goctx.Context) error
 
 	// RollbackTxn undoes the transaction operations.
 	RollbackTxn() error
@@ -55,29 +60,37 @@ type IContext interface {
 	CurrentDB() string
 
 	// Execute executes a SQL statement.
-	Execute(sql string) ([]ResultSet, error)
+	Execute(goCtx goctx.Context, sql string) ([]ResultSet, error)
 
 	// SetClientCapability sets client capability flags
 	SetClientCapability(uint32)
 
 	// Prepare prepares a statement.
-	Prepare(sql string) (statement IStatement, columns, params []*ColumnInfo, err error)
+	Prepare(sql string) (statement PreparedStatement, columns, params []*ColumnInfo, err error)
 
-	// GetStatement gets IStatement by statement ID.
-	GetStatement(stmtID int) IStatement
+	// GetStatement gets PreparedStatement by statement ID.
+	GetStatement(stmtID int) PreparedStatement
 
 	// FieldList returns columns of a table.
 	FieldList(tableName string) (columns []*ColumnInfo, err error)
 
-	// Close closes the IContext.
+	// Close closes the QueryCtx.
 	Close() error
 
 	// Auth verifies user's authentication.
-	Auth(user string, auth []byte, salt []byte) bool
+	Auth(user *auth.UserIdentity, auth []byte, salt []byte) bool
+
+	// ShowProcess shows the information about the session.
+	ShowProcess() util.ProcessInfo
+
+	SetSessionManager(util.SessionManager)
+
+	// Cancel the execution of current transaction.
+	Cancel()
 }
 
-// IStatement is the interface to use a prepared statement.
-type IStatement interface {
+// PreparedStatement is the interface to use a prepared statement.
+type PreparedStatement interface {
 	// ID returns statement ID
 	ID() int
 
@@ -93,6 +106,12 @@ type IStatement interface {
 	// BoundParams returns bound parameters.
 	BoundParams() [][]byte
 
+	// SetParamsType sets type for parameters.
+	SetParamsType([]byte)
+
+	// GetParamsType returns the type for parameters.
+	GetParamsType() []byte
+
 	// Reset removes all bound parameters.
 	Reset()
 
@@ -102,7 +121,10 @@ type IStatement interface {
 
 // ResultSet is the result set of an query.
 type ResultSet interface {
-	Columns() ([]*ColumnInfo, error)
-	Next() ([]types.Datum, error)
+	Columns() []*ColumnInfo
+	Next() (types.Row, error)
+	SupportChunk() bool
+	NewChunk() *chunk.Chunk
+	NextChunk(chk *chunk.Chunk) error
 	Close() error
 }
